@@ -367,6 +367,7 @@ class ModelConfig:
     mm_encoder_fp8_scale_save_margin: InitVar[float | None] = None
     interleave_mm_strings: InitVar[bool | None] = None
     skip_mm_profiling: InitVar[bool | None] = None
+    image_pruning_rate: InitVar[float | None] = None
     video_pruning_rate: InitVar[float | None] = None
     mm_tensor_ipc: InitVar[MMTensorIPC] = None
     mm_ipc_gpu_memory_gb: InitVar[float | None] = None
@@ -495,6 +496,7 @@ class ModelConfig:
         mm_encoder_fp8_scale_save_margin: float | None,
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
+        image_pruning_rate: float | None,
         video_pruning_rate: float | None,
         mm_tensor_ipc: MMTensorIPC,
         mm_ipc_gpu_memory_gb: float | None,
@@ -709,6 +711,7 @@ class ModelConfig:
                 mm_encoder_fp8_scale_save_margin=mm_encoder_fp8_scale_save_margin,
                 interleave_mm_strings=interleave_mm_strings,
                 skip_mm_profiling=skip_mm_profiling,
+                image_pruning_rate=image_pruning_rate,
                 video_pruning_rate=video_pruning_rate,
                 mm_tensor_ipc=mm_tensor_ipc,
                 mm_ipc_gpu_memory_gb=mm_ipc_gpu_memory_gb,

@@ -11,7 +11,8 @@
 import typing
 
 import torch
-
+from functools import lru_cache
+import torch.nn.functional as F
 
 def compute_retained_tokens_count(
     tokens_per_frame: int, num_frames: int, q: float
@@ -31,7 +32,7 @@ def compute_retained_tokens_count(
     """
     total_tokens = tokens_per_frame * num_frames
     evs_num_tokens = int(total_tokens * (1 - q))
-    min_num_tokens = tokens_per_frame
+    min_num_tokens = tokens_per_frame if num_frames > 1 else 1
     return max(min_num_tokens, evs_num_tokens)
 
 
@@ -91,6 +92,68 @@ def compute_retention_mask(
     mask = retention_mask.view(-1)  # "T H W -> (T H W)"
     return mask
 
+def compute_retention_mask_rate(
+    embeds: torch.Tensor,
+    size_thw: torch.LongTensor | tuple[int,int,int],
+    spatial_merge_size: int,
+    q: float,
+    pivot_block_size: int = 32,
+    pair_block_size: int = 16,
+    skip_ratio: float = 0.01,
+    num_proj: int = 8,
+) -> torch.Tensor:
+    T,H,W = map(int,size_thw)
+    tokens_per_frame = (H // spatial_merge_size) * (W // spatial_merge_size)
+    
+    scores = _get_diversity_scores(
+        embeds,
+        pivot_block_size = pivot_block_size,
+        pair_block_size = pair_block_size,
+        skip_num = max(0,int(skip_ratio*embeds.shape[0])),
+        num_proj = num_proj,
+    )
+    order = torch.argsort(scores, dim=-1, descending=False, stable=True)
+    retain_num_tokens = compute_retained_tokens_count(tokens_per_frame=tokens_per_frame,num_frames=T,q=q)
+    top_indices = order[:retain_num_tokens]
+
+    retention_mask = torch.zeros([embeds.shape[0]],dtype=torch.bool,device=embeds.device)
+    retention_mask[top_indices] = True
+    return retention_mask
+
+@lru_cache()
+def _get_random_projections(num_proj,embed_dim,dtype,device):
+    return F.normalize(torch.randn(num_proj,embed_dim,dtype=dtype,device=device),p=2,dim=-1)
+
+def _get_diversity_scores(
+    embeds: torch.Tensor,
+    pivot_block_size: int,
+    pair_block_size: int,
+    skip_num: int,
+    num_proj: int,
+):
+    if embeds.shape[0] < pivot_block_size:
+        return torch.ones(embeds.shape[0], dtype=embeds.dtype, device=embeds.device)
+    
+    seq_norm_embeds = F.normalize(embeds, p=2, dim=-1)
+
+    rand_proj = _get_random_projections(
+        num_proj = num_proj,
+        embed_dim = embeds.shape[-1],
+        dtype=embeds.dtype,
+        device=embeds.device,
+    )
+    init_scores = torch.einsum("ik,jk->i", seq_norm_embeds, rand_proj)
+    sorted_values, sorted_idx = init_scores.sort(dim=-1, descending=False, stable=True)
+
+    q_scale = (sorted_values.shape[0] / pivot_block_size) / (sorted_values[skip_num] - sorted_values[-skip_num])
+    sorted_q_values = sorted_values.mul_(q_scale).round_()
+    sorted_q_mask = sorted_q_values[:-1] > sorted_q_values[1:]
+    pivot_idx = torch.cat([sorted_idx[:1], sorted_idx[1:][sorted_q_mask]],dim=-1)
+    pivot_set = seq_norm_embeds[pivot_idx]
+
+    scores = (1. / pivot_set.shape[0]) * torch.einsum("ik,jk->i", seq_norm_embeds, pivot_set)
+    scores[pivot_idx] = 0.0
+    return scores
 
 def compute_mrope_for_media(
     video_size_thw: torch.LongTensor,
@@ -235,6 +298,28 @@ def recompute_mrope_positions(
         0
     ]
 
+    def _get_next_media_start(
+        vis_start_idx: torch.Tensor, 
+        num_computed: int,
+    ) -> tuple[int,int]:
+        """
+        Find the next media segment start position. Returns (global_mm_start, mm_embeddings_seen). 
+        Falls back to the first media token when no vision_start_token_id is found,
+        (e.g., image pruning with reduced placeholders)
+        """
+        candidate = vis_start_idx[vis_start_idx >= num_computed]
+        if candidate.numel() > 0:
+            return int(candidate[0].item()), 0
+        arange = torch.arange(N,device=input_ids.device)
+        media_after = (media_mask & (arange>num_computed)).nonzero(as_tuple=True)[0]
+        if media_after.numel() == 0:
+            raise IndexError(
+                "recompute_mrope_positions: no vision_start_token_id and no "
+                "media tokens >= num_computed_tokens"
+            )
+        first_media = int(media_after[0].item())
+        return max(0, first_media - 1), first_media - max(0, first_media-1) - 1
+
     for mm_pos in multimodal_positions:
         # Each mm_pos can be a complete embedding for single media
         # or it can be a part of a single media (due to chunked prefill)
@@ -295,21 +380,16 @@ def recompute_mrope_positions(
             else:
                 # We have completed previous mm_embedding part and
                 # ready to start a new one
-                next_vision_start_token = vision_start_indices[
-                    vision_start_indices >= num_computed_tokens
-                ][0]
-                mm_embeddings_seen = 0
-                global_mm_start = next_vision_start_token
+                global_mm_start, mm_embeddings_seen = _get_next_media_start(
+                    vision_start_indices, num_computed_tokens
+                )
 
         else:
             # If there were no vision start indexes so far,
             # let's find first vision start index
-            next_vision_start_token = vision_start_indices[
-                vision_start_indices >= num_computed_tokens
-            ][0]
-
-            mm_embeddings_seen = 0
-            global_mm_start = next_vision_start_token
+            global_mm_start, mm_embeddings_seen = _get_next_media_start(
+                vision_start_indices, num_computed_tokens
+            )
 
         # For Qwen3 VL, mm_pos includes timestamp tokens before vision_start
         # when starting a new media. Adjust global_mm_start to point to where

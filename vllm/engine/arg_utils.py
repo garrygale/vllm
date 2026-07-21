@@ -583,6 +583,7 @@ class EngineArgs:
     io_processor_plugin: str | None = None
     renderer_num_workers: int = 1
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
+    image_pruning_rate: float | None = MultiModalConfig.image_pruning_rate
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     mm_tensor_ipc: MMTensorIPC = MultiModalConfig.mm_tensor_ipc
     mm_ipc_gpu_memory_gb: float = MultiModalConfig.mm_ipc_gpu_memory_gb
@@ -1294,7 +1295,9 @@ class EngineArgs:
         multimodal_group.add_argument(
             "--skip-mm-profiling", **multimodal_kwargs["skip_mm_profiling"]
         )
-
+        multimodal_group.add_argument(
+            "--image-pruning-rate", **multimodal_kwargs["image_pruning_rate"]
+        )
         multimodal_group.add_argument(
             "--video-pruning-rate", **multimodal_kwargs["video_pruning_rate"]
         )
@@ -1670,6 +1673,7 @@ class EngineArgs:
             model_impl=self.model_impl,
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,
+            image_pruning_rate=self.image_pruning_rate,
             video_pruning_rate=self.video_pruning_rate,
             mm_tensor_ipc=self.mm_tensor_ipc,
             mm_ipc_gpu_memory_gb=self.mm_ipc_gpu_memory_gb,

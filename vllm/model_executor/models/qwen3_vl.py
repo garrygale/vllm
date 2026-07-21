@@ -73,6 +73,7 @@ from vllm.multimodal.evs import (
     compute_mrope_for_media,
     compute_retained_tokens_count,
     compute_retention_mask,
+    compute_retention_mask_rate,
     recompute_mrope_positions,
 )
 from vllm.multimodal.inputs import (
@@ -1420,6 +1421,15 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             assert isinstance(grid_thw, torch.Tensor)
 
             num_tokens = int(grid_thw.prod()) // merge_length
+
+            image_pruning_rate = self.info.ctx.get_mm_config().image_pruning_rate
+            if image_pruning_rate is not None and image_pruning_rate > 0.0:
+                num_tokens = compute_retained_tokens_count(
+                    tokens_per_frame=num_tokens,
+                    num_frames=1,
+                    q = image_pruning_rate,
+                )
+
             return [hf_processor.image_token_id] * num_tokens
 
         def get_video_replacement_qwen3vl(item_idx: int):
@@ -1701,10 +1711,9 @@ class Qwen3VLForConditionalGeneration(
         self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        self.image_pruning_rate = multimodal_config.image_pruning_rate
         self.video_pruning_rate = multimodal_config.video_pruning_rate
-        self.is_multimodal_pruning_enabled = (
-            multimodal_config.is_multimodal_pruning_enabled()
-        )
+        self.is_multimodal_pruning_enabled = multimodal_config.is_multimodal_pruning_enabled()
 
         self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
         self.deepstack_num_level = (
@@ -2209,12 +2218,19 @@ class Qwen3VLForConditionalGeneration(
         """
         if self.is_multimodal_pruning_enabled:
             merge_size = self.visual.spatial_merge_size
+            compute_retention_mask_func = compute_retention_mask_rate
             grid_thw = image_input["image_grid_thw"]
             grid_thw_list = grid_thw.tolist()
             image_embeds_out = []
             for emb, size in zip(image_embeds_split, grid_thw_list):
                 positions = compute_mrope_for_media(size, merge_size).to(
                     emb.device, non_blocking=True
+                )
+                retention_mask = compute_retention_mask_func(
+                    emb,
+                    size,
+                    spatial_merge_size=self.visual.spatial_merge_size,
+                    q = self.image_pruning_rate,
                 )
                 positions = torch.cat(
                     [
@@ -2226,6 +2242,7 @@ class Qwen3VLForConditionalGeneration(
                     dim=1,
                 )
                 emb = torch.cat([emb, positions], dim=1)
+                emb = emb[retention_mask]
                 image_embeds_out.append(emb)
             image_embeds_split = tuple(image_embeds_out)
         return image_embeds_split
@@ -2252,6 +2269,7 @@ class Qwen3VLForConditionalGeneration(
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()
         merge_size = self.visual.spatial_merge_size
+        compute_retention_mask_func = compute_retention_mask_rate
 
         # Apply EVS to each video.
         video_embeds_out = []
@@ -2264,7 +2282,7 @@ class Qwen3VLForConditionalGeneration(
             if self.is_multimodal_pruning_enabled:
                 # For each video, compute retention mask using EVS.
                 # retention_mask: [11424].
-                retention_mask = compute_retention_mask(
+                retention_mask = compute_retention_mask_func(
                     emb,
                     size,
                     spatial_merge_size=self.visual.spatial_merge_size,
@@ -2512,7 +2530,8 @@ class Qwen3VLForConditionalGeneration(
                 assert t == 1, f"Image must have 1 frame, got {t}"
                 llm_grid_h = h // spatial_merge_size
                 llm_grid_w = w // spatial_merge_size
-                yield offset, llm_grid_h, llm_grid_w, llm_grid_h * llm_grid_w
+                actual_num_tokens = mm_feature.mm_position.length
+                yield offset, llm_grid_h, llm_grid_w, actual_num_tokens
             elif mm_feature.modality == "video":
                 t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
                 llm_grid_h = h // spatial_merge_size
@@ -2620,6 +2639,12 @@ class Qwen3VLForConditionalGeneration(
                     full_grid = np.indices((1, llm_grid_h, llm_grid_w)).reshape(3, -1)
                     grid_indices = full_grid[:, :remainder]
                     llm_pos_ids_list.append(grid_indices + text_len + st_idx)
+            elif actual_num_tokens < expected_tokens_per_frame:
+                # pruned images: create truncated grid positions as placeholders
+                # will be corrected by recompute_mrope_positions
+                full_grid = np.indices((1, llm_grid_h, llm_grid_w)).reshape(3,-1)
+                grid_indices = full_grid[:,:actual_num_tokens]
+                llm_pos_ids_list.append(grid_indices + text_len + st_idx)
             else:
                 # Normal case: frame has exactly the expected tokens (after actual EVS
                 # pruning).
