@@ -599,8 +599,8 @@ class Qwen3DominoForCausalLM(nn.Module):
             self.model.target_hidden_size,
         )
         fusion_w = torch.softmax(self.model.layer_fusion_weights, dim=1)
-        # [D, T] x [T, N, H] -> [D, N, H] without materializing [N, D, T, H].
-        fused = torch.einsum("dt,tnh->dnh", fusion_w, target)
+        # [D, T] x [N, T, H] -> [D, N, H] without materializing [N, D, T, H].
+        fused = torch.einsum("dt,nth->dnh", fusion_w, target)
         fused = fused.permute(1, 0, 2).reshape(
             -1,
             self.model.config.num_hidden_layers * self.model.target_hidden_size,
