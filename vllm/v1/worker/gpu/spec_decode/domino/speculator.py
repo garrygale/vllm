@@ -49,9 +49,11 @@ class DominoSpeculator(DSparkSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        # Milestone 1 is eager-only.  The sequential GRU loop is intentionally
-        # left out of graph capture until the eager path is validated.
-        super().init_cudagraph_manager(CUDAGraphMode.NONE)
+        # Let DFlash's graph manager decide: FULL / FULL_DECODE_ONLY is
+        # captured as an ACL graph on Ascend, while PIECEWISE / NONE stays
+        # eager. The fixed-length GRU correction loop is unrolled during
+        # capture, so it is part of the same graph.
+        super().init_cudagraph_manager(cudagraph_mode)
 
     def load_draft_model(
         self,
