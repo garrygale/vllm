@@ -748,20 +748,6 @@ class Qwen3DominoForCausalLM(nn.Module):
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
             else:
-                # Renumber draft layers so they don't collide with target layer
-                # names in the KV-cache/attention registry.
-                parts = name.split(".")
-                if (
-                    len(parts) >= 2
-                    and parts[0] == "layers"
-                    and parts[1].isdigit()
-                ):
-                    layer_idx = int(parts[1])
-                    if layer_idx < self.model.config.num_hidden_layers:
-                        name = (
-                            f"layers.{layer_idx + self.model.start_layer_id}."
-                            + ".".join(parts[2:])
-                        )
                 if "lm_head" not in name:
                     name = "model." + name
 
