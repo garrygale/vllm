@@ -558,7 +558,7 @@ class VllmConfig:
         # raises rather than silently falling back to V1 (which can't run dspark).
         if (
             self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
+            and self.speculative_config.method in ("dspark", "domino")
         ):
             return True
 
@@ -1040,7 +1040,7 @@ class VllmConfig:
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
-                    and self.speculative_config.method != "dspark"
+                    and self.speculative_config.method not in ("dspark", "domino")
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
@@ -1072,7 +1072,7 @@ class VllmConfig:
                 self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
-                and self.speculative_config.method != "dspark"
+                and self.speculative_config.method not in ("dspark", "domino")
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -2161,6 +2161,7 @@ class VllmConfig:
                 "mtp",
                 "dflash",
                 "dspark",
+                "domino",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
@@ -2169,7 +2170,7 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dspark", "domino")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
