@@ -645,7 +645,10 @@ class Qwen3DominoForCausalLM(nn.Module):
                     attn.head_dim,
                 )
             ).view(k_shape)
-            k, _ = attn.rotary_emb(context_positions, k, None)
+            # Ascend's rotary op requires a real key tensor (it does not accept
+            # None like the CUDA/native path). Passing a clone is a no-op for
+            # the key side and keeps the NPU path valid.
+            k, _ = attn.rotary_emb(context_positions, k, k.clone())
 
             if context_slot_mapping is None:
                 continue
