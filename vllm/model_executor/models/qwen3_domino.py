@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Qwen3Config
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config, replace
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -445,6 +446,7 @@ class Qwen3DominoModel(nn.Module):
         # Optional NPU fp16 GRU parameter cache.  Populated by the Ascend
         # wrapper after weight loading.
         self._gru_fp16 = None
+        self._use_fused_context_kv = False
 
     def _init_fusion_weights(self) -> None:
         nn.init.constant_(self.layer_fusion_weights, 0.0)
@@ -476,6 +478,280 @@ class Qwen3DominoModel(nn.Module):
         if self.output_proj is not None:
             hidden_states = self.output_proj(hidden_states)
         return self.norm(hidden_states)
+
+    def _build_fused_kv_buffers(self) -> None:
+        """Build fused buffers for :meth:`precompute_and_store_context_kv`.
+
+        Stacks the target K/V projection weights, the k-norm weights, and the
+        RoPE parameters from every draft layer so the context states can be
+        projected with one batched GEMM.  All layers share the same
+        pre-projection ``hidden_norm``; flattening ``[T, D, H]`` to
+        ``[T*D, H]`` lets a single grouped RMSNorm replace the per-layer loop.
+
+        Only used when the projections are unquantized; with a quantization
+        config the per-layer loop remains active.
+        """
+        layers_attn = [layer.self_attn for layer in self.layers]
+        attn0 = layers_attn[0]
+        k_proj = attn0.k_proj_target
+
+        if (
+            self.quant_config is not None
+            or not k_proj.weight.data.is_floating_point()
+        ):
+            logger.warning_once(
+                "Domino fused context-KV precompute requires unquantized "
+                "k_proj_target/v_proj_target; using the per-layer path."
+            )
+            self._use_fused_context_kv = False
+            return
+
+        # KV projection weights, transposed for bmm:
+        # [num_layers, target_hidden_size, 2 * kv_size]
+        fused_kv_weights_T: list[torch.Tensor] = []
+        fused_kv_biases: list[torch.Tensor] = []
+        has_bias = k_proj.bias is not None
+        for attn in layers_attn:
+            kv_weight = torch.cat(
+                [
+                    attn.k_proj_target.weight.data,
+                    attn.v_proj_target.weight.data,
+                ],
+                dim=0,
+            )
+            fused_kv_weights_T.append(kv_weight.t().contiguous())
+            if has_bias:
+                fused_kv_biases.append(
+                    torch.cat(
+                        [
+                            attn.k_proj_target.bias.data,
+                            attn.v_proj_target.bias.data,
+                        ],
+                        dim=0,
+                    )
+                )
+        self._fused_kv_weight_T = torch.stack(fused_kv_weights_T, dim=0)
+        self._fused_kv_bias = (
+            torch.stack(fused_kv_biases, dim=0) if has_bias else None
+        )
+
+        self._hidden_norm_weight = self.hidden_norm.weight.data
+        self._hidden_norm_eps = self.hidden_norm.variance_epsilon
+        self._k_norm_weights = torch.stack(
+            [attn.k_norm.weight.data for attn in layers_attn], dim=0
+        ).contiguous()
+
+        # RoPE parameters
+        self._rope_head_size = attn0.rotary_emb.head_size
+        self._rope_cos_sin_cache = attn0.rotary_emb.cos_sin_cache
+        self._rope_is_neox = attn0.rotary_emb.is_neox_style
+        for attn in layers_attn[1:]:
+            assert (
+                attn.rotary_emb.head_size == self._rope_head_size
+                and attn.rotary_emb.is_neox_style == self._rope_is_neox
+            ), (
+                "All layers must have the same RoPE parameters for Domino "
+                "precomputation"
+            )
+
+        # Layer metadata
+        self._num_attn_layers = len(layers_attn)
+        self._kv_size = attn0.kv_size
+        self._head_dim = attn0.head_dim
+        self._num_kv_heads = attn0.num_kv_heads
+        self._rms_norm_eps = attn0.k_norm.variance_epsilon
+        for attn in layers_attn[1:]:
+            assert (
+                attn.kv_size == self._kv_size
+                and attn.head_dim == self._head_dim
+                and attn.num_kv_heads == self._num_kv_heads
+                and attn.k_norm.variance_epsilon == self._rms_norm_eps
+            ), (
+                "All layers must have the same attn config for Domino "
+                "precomputation"
+            )
+
+        # References to inner Attention layers for direct cache writes
+        self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        self._use_fused_context_kv = True
+
+    def _project_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # --- Fused KV projection (one batched GEMM for all layers) ---
+        # All layers share the same hidden_norm, so the [T, D, H] context is
+        # flattened to [T*D, H], normalized with a single kernel, then
+        # projected through the per-layer K/V weights with one bmm.
+        H = self.target_hidden_size
+        normed_context_states = torch.empty_like(context_states)
+        ops.rms_norm(
+            normed_context_states.view(num_ctx * num_layers, H),
+            context_states.reshape(num_ctx * num_layers, H),
+            self._hidden_norm_weight,
+            self._hidden_norm_eps,
+        )
+        fused = normed_context_states.view(num_ctx, num_layers, H)
+        all_kv_flat = torch.bmm(
+            fused.permute(1, 0, 2).contiguous(), self._fused_kv_weight_T
+        )
+        if self._fused_kv_bias is not None:
+            all_kv_flat = all_kv_flat + self._fused_kv_bias.unsqueeze(1)
+        # [D, T, 2, nkv, hd]; dim-2 slices are contiguous K and V.
+        all_kv = all_kv_flat.view(
+            num_layers, num_ctx, 2, num_kv_heads, head_dim
+        )
+        all_k = all_kv[:, :, 0]  # [D, T, nkv, hd], contiguous
+        all_v = all_kv[:, :, 1]  # [D, T, nkv, hd], contiguous
+        return all_k, all_v
+
+    def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
+        # --- Grouped RMSNorm K across all layers ([D, T, nkv, hd]) ---
+        # The weight is selected per layer by the outermost (layer) index.
+        all_k_normed = torch.empty_like(all_k)
+        ops.rms_norm(
+            all_k_normed,
+            all_k,
+            self._k_norm_weights,
+            self._rms_norm_eps,
+        )
+        return all_k_normed
+
+    def precompute_and_store_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> None:
+        """Project flare-fused context states and write them into draft KV caches.
+
+        ``context_states`` is the output of
+        :meth:`Qwen3DominoForCausalLM.combine_hidden_states`, shaped
+        ``[T, D * target_hidden_size]``.
+
+        The fused path projects all layers with one batched GEMM, applies a
+        grouped k-norm and a fused RoPE, then inserts each layer's K/V into its
+        cache.
+        """
+        if context_states.dim() != 2:
+            raise ValueError(
+                "Domino precompute expects 2D flare-fused context states, got "
+                f"{context_states.shape}"
+            )
+
+        if not hasattr(self, "_num_attn_layers"):
+            logger.warning_once(
+                "Domino fused buffer initialization was skipped. If dummy "
+                "weights are not in use, this may indicate an error in weight "
+                "loading."
+            )
+            self._build_fused_kv_buffers()
+
+        if not self._use_fused_context_kv:
+            self._precompute_and_store_context_kv_per_layer(
+                context_states, context_positions, context_slot_mapping
+            )
+            return
+
+        num_ctx = context_states.shape[0]
+        D = self._num_attn_layers
+        kv = self._kv_size
+        hd = self._head_dim
+        nkv = self._num_kv_heads
+
+        all_k, all_v = self._project_context_kv(
+            context_states, num_ctx, D, nkv, hd
+        )
+        all_k_normed = self._normalize_context_k(all_k)
+
+        # --- Fused RoPE across all layers ---
+        # View as [D * num_ctx, kv] so RoPE sees one big batch (no copy).
+        # In-place RoPE: pass K as the "query" arg with key=None.
+        all_k_flat = all_k_normed.view(D * num_ctx, kv)
+        positions_repeated = context_positions.repeat(D)
+        cos_sin_cache = self._rope_cos_sin_cache
+        if cos_sin_cache.dtype != all_k_flat.dtype:
+            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+        ops.rotary_embedding(
+            positions_repeated,
+            all_k_flat,
+            None,
+            self._rope_head_size,
+            cos_sin_cache,
+            self._rope_is_neox,
+        )
+
+        if context_slot_mapping is None:
+            return
+
+        # --- Per-layer cache insert ---
+        all_k_final = all_k_flat.view(D, num_ctx, nkv, hd)
+        per_layer = isinstance(context_slot_mapping, (list, tuple))
+        for i in range(D):
+            slot_mapping = (
+                context_slot_mapping[i] if per_layer else context_slot_mapping
+            )
+            if slot_mapping is None:
+                continue  # dummy run: skip cache ops
+            attn = self._attn_layers[i]
+            kv_cache = attn.kv_cache
+            attn.impl.do_kv_cache_update(
+                attn,
+                all_k_final[i],
+                all_v[i],
+                kv_cache,
+                slot_mapping,
+            )
+
+    def _precompute_and_store_context_kv_per_layer(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> None:
+        """Per-layer fallback of :meth:`precompute_and_store_context_kv`."""
+        num_ctx = context_states.shape[0]
+        D = self.config.num_hidden_layers
+        H = self.target_hidden_size
+        fused = context_states.view(num_ctx, D, H)
+        per_layer = isinstance(context_slot_mapping, (list, tuple))
+
+        for i, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            ctx = self.hidden_norm(fused[:, i, :])
+            k = attn.k_proj_target(ctx)
+            v = attn.v_proj_target(ctx)
+            k_shape = k.shape
+            k = attn.k_norm(
+                k.view(
+                    *k_shape[:-1],
+                    k_shape[-1] // attn.head_dim,
+                    attn.head_dim,
+                )
+            ).view(k_shape)
+            # Ascend's rotary op requires a real key tensor (it does not accept
+            # None like the CUDA/native path). Passing a clone is a no-op for
+            # the key side and keeps the NPU path valid.
+            k, _ = attn.rotary_emb(context_positions, k, k.clone())
+
+            if context_slot_mapping is None:
+                continue
+            slot_mapping = (
+                context_slot_mapping[i] if per_layer else context_slot_mapping
+            )
+            if slot_mapping is None:
+                continue
+            attn.attn.impl.do_kv_cache_update(
+                attn.attn,
+                k.reshape(num_ctx, attn.num_kv_heads, attn.head_dim),
+                v.reshape(num_ctx, attn.num_kv_heads, attn.head_dim),
+                attn.attn.kv_cache,
+                slot_mapping,
+            )
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
@@ -615,55 +891,10 @@ class Qwen3DominoForCausalLM(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
-        """Project flare-fused context states and write them into draft KV caches.
-
-        ``context_states`` is the output of :meth:`combine_hidden_states`,
-        shaped ``[T, D * target_hidden_size]``.
-        """
-        if context_states.dim() != 2:
-            raise ValueError(
-                "Domino precompute expects 2D flare-fused context states, got "
-                f"{context_states.shape}"
-            )
-
-        num_ctx = context_states.shape[0]
-        D = self.model.config.num_hidden_layers
-        H = self.model.target_hidden_size
-        fused = context_states.view(num_ctx, D, H)
-        per_layer = isinstance(context_slot_mapping, (list, tuple))
-
-        for i, layer in enumerate(self.model.layers):
-            attn = layer.self_attn
-            ctx = self.model.hidden_norm(fused[:, i, :])
-            k = attn.k_proj_target(ctx)
-            v = attn.v_proj_target(ctx)
-            k_shape = k.shape
-            k = attn.k_norm(
-                k.view(
-                    *k_shape[:-1],
-                    k_shape[-1] // attn.head_dim,
-                    attn.head_dim,
-                )
-            ).view(k_shape)
-            # Ascend's rotary op requires a real key tensor (it does not accept
-            # None like the CUDA/native path). Passing a clone is a no-op for
-            # the key side and keeps the NPU path valid.
-            k, _ = attn.rotary_emb(context_positions, k, k.clone())
-
-            if context_slot_mapping is None:
-                continue
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
-            if slot_mapping is None:
-                continue
-            attn.attn.impl.do_kv_cache_update(
-                attn.attn,
-                k.reshape(num_ctx, attn.num_kv_heads, attn.head_dim),
-                v.reshape(num_ctx, attn.num_kv_heads, attn.head_dim),
-                attn.attn.kv_cache,
-                slot_mapping,
-            )
+        """Project flare-fused context states and write them into draft KV caches."""
+        self.model.precompute_and_store_context_kv(
+            context_states, context_positions, context_slot_mapping
+        )
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -774,6 +1005,7 @@ class Qwen3DominoForCausalLM(nn.Module):
 
         loader = AutoWeightsLoader(self, skip_substrs=skip_substrs)
         loader.load_weights(model_weights.items())
+        self.model._build_fused_kv_buffers()
 
 
 def load_domino_model(
