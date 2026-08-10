@@ -504,6 +504,28 @@ class Qwen3DominoModel(nn.Module):
                 "k_proj_target/v_proj_target; using the per-layer path."
             )
             self._use_fused_context_kv = False
+            # Drop fused buffers built from the unquantized weights so a later
+            # rebuild (e.g. after on-the-fly quantization) frees the memory.
+            for attr in (
+                "_fused_kv_weight_T",
+                "_fused_kv_bias",
+                "_k_norm_weights",
+                "_attn_layers",
+                "_rope_head_size",
+                "_rope_cos_sin_cache",
+                "_rope_is_neox",
+                "_kv_size",
+                "_head_dim",
+                "_num_kv_heads",
+                "_rms_norm_eps",
+                "_hidden_norm_weight",
+                "_hidden_norm_eps",
+            ):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            # Mark the fused decision as made so the precompute does not
+            # re-attempt the build on every step.
+            self._num_attn_layers = len(layers_attn)
             return
 
         # KV projection weights, transposed for bmm:
