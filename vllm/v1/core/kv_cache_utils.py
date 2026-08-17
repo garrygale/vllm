@@ -929,7 +929,11 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     try:
         kv_cache_spec_values = list(kv_cache_spec.values())
         _ = kv_cache_spec_values[0].merge(kv_cache_spec_values)
-    except AssertionError:
+    except (AssertionError, ValueError):
+        # Mixed layer types raise AssertionError; same-type layers with
+        # different sliding windows (e.g. a per-layer SWA drafter) raise
+        # ValueError from merge_window_sizes.  Both mean non-uniform, and
+        # the general multi-group path groups layers by identical spec.
         return False
     return True
 
