@@ -280,7 +280,31 @@ class HFConfigParser(ConfigParserBase):
         if extra_layer_types := _PATCH_HF_ALLOWED_LAYER_TYPES.get(model_type):
             _patch_hf_transformers_allowed_layer_types(extra_layer_types)
 
-        if model_type in _SPECULATIVE_DECODING_CONFIGS:
+        # Transformers v5 strictly validates typed config fields, and
+        # Qwen3Config declares `sliding_window: int | None`.  SpecForge
+        # DFlash/Domino draft checkpoints carry a per-layer window list in
+        # the top-level `sliding_window` instead; build the config from a
+        # sanitized dict with the list relocated into the unstructured
+        # `dflash_config` dict (kwargs cannot help here: `from_dict` only
+        # applies them after construction, which already raised).
+        config = None
+        if (
+            isinstance(config_dict.get("sliding_window"), list)
+            and isinstance(config_dict.get("dflash_config"), dict)
+        ):
+            relocated_dflash_config = dict(config_dict["dflash_config"])
+            relocated_dflash_config.setdefault(
+                "sliding_window", config_dict["sliding_window"]
+            )
+            sanitized_config_dict = dict(config_dict)
+            sanitized_config_dict["sliding_window"] = None
+            sanitized_config_dict["dflash_config"] = relocated_dflash_config
+            config = AutoConfig.for_model(
+                sanitized_config_dict.pop("model_type"),
+                **sanitized_config_dict,
+            )
+
+        if config is None and model_type in _SPECULATIVE_DECODING_CONFIGS:
             config_class = _CONFIG_REGISTRY[model_type]
             config = config_class.from_pretrained(
                 model,
@@ -289,7 +313,7 @@ class HFConfigParser(ConfigParserBase):
                 trust_remote_code=trust_remote_code,
                 **kwargs,
             )
-        else:
+        elif config is None:
             if model_type in _CONFIG_REGISTRY:
                 # Register the config class to AutoConfig to ensure it's used
                 # in future calls to `from_pretrained` (e.g. from

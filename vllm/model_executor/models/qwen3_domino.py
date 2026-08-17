@@ -96,7 +96,13 @@ def _domino_layer_attention(
     if layer_types[layer_idx] != "sliding_attention":
         return None, causal
 
-    sliding_window = getattr(config, "sliding_window", None)
+    # The config loader relocates a per-layer list from the top-level
+    # `sliding_window` into `dflash_config.sliding_window` to satisfy
+    # transformers strict field validation; read the relocated value
+    # first and fall back to the top-level field.
+    sliding_window = dflash_config.get("sliding_window")
+    if sliding_window is None:
+        sliding_window = getattr(config, "sliding_window", None)
     if sliding_window is None:
         return None, causal
     if isinstance(sliding_window, (list, tuple)):
