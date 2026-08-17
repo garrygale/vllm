@@ -28,6 +28,17 @@ class DominoSpeculator(DSparkSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
+        # Domino draft layers are non-causal on every layer (block-
+        # bidirectional training), including sliding-window layers; the
+        # DFlash default (sliding layers causal) does not apply.
+        from vllm.model_executor.models.qwen3_domino import (
+            domino_has_any_non_causal,
+        )
+
+        self.requires_non_causal = domino_has_any_non_causal(
+            self.draft_model_config.hf_config
+        )
+
         self.sample_from_anchor = True
         self.num_query_per_req = self.num_speculative_steps
 

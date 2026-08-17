@@ -46,6 +46,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+)
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .utils import (
@@ -64,6 +69,83 @@ def _dflash_config(config: Qwen3Config) -> dict:
 
 def _is_domino(config: Qwen3Config) -> bool:
     return _dflash_config(config).get("projector_type") == "domino"
+
+
+def _domino_layer_attention(
+    config: Qwen3Config, layer_idx: int
+) -> tuple[int | None, bool]:
+    """Resolve (sliding_window, causal) for one Domino draft layer.
+
+    A layer uses sliding-window attention when its ``config.layer_types``
+    entry is ``"sliding_attention"``.  The window is the per-layer entry of
+    ``config.sliding_window`` (a list with one value per draft layer) or the
+    scalar value shared by all sliding layers, mirroring SpecForge's
+    ``get_layer_sliding_window``: ``-1``/missing/invalid entries resolve to
+    ``None`` (full attention).
+
+    Domino draft layers are trained with block-bidirectional (non-causal)
+    attention on every layer, so the default is non-causal; a
+    ``dflash_config.causal`` override wins when present.
+    """
+    dflash_config = _dflash_config(config)
+    causal = bool(dflash_config.get("causal", False))
+
+    layer_types = getattr(config, "layer_types", None)
+    if not layer_types or layer_idx >= len(layer_types):
+        return None, causal
+    if layer_types[layer_idx] != "sliding_attention":
+        return None, causal
+
+    sliding_window = getattr(config, "sliding_window", None)
+    if sliding_window is None:
+        return None, causal
+    if isinstance(sliding_window, (list, tuple)):
+        if layer_idx >= len(sliding_window):
+            return None, causal
+        value = sliding_window[layer_idx]
+    else:
+        value = sliding_window
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None, causal
+    return value, causal
+
+
+def domino_has_any_non_causal(config: Qwen3Config) -> bool:
+    """Whether any Domino draft layer is non-causal.
+
+    Config mirror of the model's ``get_draft_attn_causal``, usable before the
+    model is built.
+    """
+    return not all(
+        _domino_layer_attention(config, layer_idx)[1]
+        for layer_idx in range(config.num_hidden_layers)
+    )
+
+
+class DominoDraftAttention(Attention):
+    """Draft attention with a full (non-evicted) KV cache.
+
+    Sliding-window draft layers keep the full context in the KV cache: the
+    DFlash contract precomputes and rewrites the entire context K/V every
+    step through position-aligned block tables, which window-block eviction
+    would break.  The sliding window is still applied at compute time via
+    the ``sliding_window`` carried on the full-attention spec/metadata.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if isinstance(spec, SlidingWindowSpec):
+            return FullAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size,
+                head_size_v=spec.head_size_v,
+                dtype=spec.dtype,
+                kv_quant_mode=spec.kv_quant_mode,
+                sliding_window=spec.sliding_window,
+                page_size_padded=spec.page_size_padded,
+            )
+        return spec
 
 
 class DominoQwen3Attention(nn.Module):
@@ -86,12 +168,15 @@ class DominoQwen3Attention(nn.Module):
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
+        sliding_window: int | None = None,
+        causal: bool = False,
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_name = prefix
+        self.sliding_window = sliding_window
         self.hidden_size = hidden_size
         self.target_hidden_size = target_hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -164,20 +249,23 @@ class DominoQwen3Attention(nn.Module):
             rope_parameters=rope_parameters,
         )
 
-        self.attn = Attention(
+        self.attn = DominoDraftAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         # Domino draft blocks are non-causal: every query position sees the
-        # whole context block and the current draft block.
-        self.causal = False
+        # whole context block and the current draft block.  Sliding-window
+        # layers additionally restrict the context part of the mask to the
+        # last ``sliding_window`` KV positions.
+        self.causal = causal
 
     def forward(
         self,
@@ -218,6 +306,7 @@ class DominoQwen3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
 
+        sliding_window, causal = _domino_layer_attention(config, layer_idx)
         self.self_attn = DominoQwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -227,6 +316,8 @@ class DominoQwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
             head_dim=getattr(config, "head_dim", None),
+            sliding_window=sliding_window,
+            causal=causal,
             cache_config=cache_config,
             quant_config=quant_config,
             rope_parameters=config.rope_parameters,
@@ -1040,7 +1131,6 @@ def load_domino_model(
     from vllm.compilation.backends import set_model_tag
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.model_executor.model_loader import get_model
-    from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
     from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
         _should_share,
         get_target_lm_head,
@@ -1059,7 +1149,7 @@ def load_domino_model(
         vllm_config,
         attention_config=replace(
             vllm_config.attention_config,
-            use_non_causal=dflash_has_any_non_causal(
+            use_non_causal=domino_has_any_non_causal(
                 draft_model_config.hf_config
             ),
             backend=speculative_config.attention_backend,
