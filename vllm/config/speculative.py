@@ -1057,12 +1057,21 @@ class SpeculativeConfig:
                     )
                     if (
                         domino_block_size is None
-                        or self.num_speculative_tokens != domino_block_size
+                        or not isinstance(domino_block_size, int)
+                        or isinstance(domino_block_size, bool)
+                        or domino_block_size <= 0
                     ):
                         raise ValueError(
-                            "Domino requires num_speculative_tokens == "
+                            "Domino requires a positive integer block_size in "
+                            f"the draft config; got {domino_block_size!r}."
+                        )
+                    if self.num_speculative_tokens > domino_block_size:
+                        raise ValueError(
+                            "Domino requires num_speculative_tokens <= "
                             f"block_size ({domino_block_size}); got "
-                            f"{self.num_speculative_tokens}."
+                            f"{self.num_speculative_tokens}. The block can "
+                            "serve fewer speculative tokens than its trained "
+                            "size (e.g. 7 with block_size=16)."
                         )
 
                 self.draft_tensor_parallel_size = (
