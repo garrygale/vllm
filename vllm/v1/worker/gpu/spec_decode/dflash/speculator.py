@@ -283,6 +283,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=causal,
         )
 
+    def _skip_draft_dp_sync(self) -> bool:
+        """Whether the draft dispatch can skip the cross-DP all-reduce.
+
+        DFlash/DSpark keep the sync because their draft backbones can be MoE
+        models whose EP collectives span the DP group. Dense Domino drafts run
+        no such cross-DP collectives, so the extra sync is unnecessary and can
+        deadlock when DP ranks are idle/active asymmetrically.
+        """
+        return False
+
     @torch.inference_mode()
     def propose(
         self,
@@ -408,15 +418,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-        )
+        if not is_profile and self._skip_draft_dp_sync():
+            # No cross-DP collective runs inside this drafter's forward, so
+            # dispatch against the local graph buckets only. Doing so removes
+            # the second per-step DP all-reduce that can deadlock when some DP
+            # ranks run dummy batches while others run real requests.
+            assert self.query_cudagraph_manager is not None
+            batch_desc = self.query_cudagraph_manager.dispatch(
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                num_active_loras=0,
+            )
+            num_tokens_across_dp = None
+        else:
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=is_profile,
+            )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
