@@ -429,14 +429,21 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         if not is_profile and self._skip_draft_dp_sync():
-            # No cross-DP collective runs inside this drafter's forward, so
-            # dispatch against the local graph buckets only. Doing so removes
-            # the second per-step DP all-reduce that can deadlock when some DP
-            # ranks run dummy batches while others run real requests.
+            # No cross-DP collective runs inside this drafter's forward, so we
+            # skip the second per-step DP all-reduce. Still dispatch against
+            # the main model's agreed padded request count: graph replay must
+            # select the same FULL bucket on every DP rank even when some ranks
+            # are running dummy batches.
             assert self.query_cudagraph_manager is not None
+            dispatch_num_reqs = getattr(self, "dp_main_num_reqs", None)
+            if dispatch_num_reqs is None:
+                dispatch_num_reqs = num_reqs
+            else:
+                dispatch_num_reqs = max(dispatch_num_reqs, num_reqs)
+            dispatch_num_tokens = dispatch_num_reqs * self.num_query_per_req
             batch_desc = self.query_cudagraph_manager.dispatch(
-                num_reqs,
-                num_query_tokens,
+                dispatch_num_reqs,
+                dispatch_num_tokens,
                 uniform_token_count=self.num_query_per_req,
                 num_active_loras=0,
             )
@@ -448,7 +455,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp = (
                 torch.full(
                     (self.dp_size,),
-                    num_query_tokens,
+                    batch_desc.num_tokens,
                     dtype=torch.int32,
                     device="cpu",
                 )

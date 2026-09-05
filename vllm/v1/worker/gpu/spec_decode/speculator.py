@@ -101,6 +101,12 @@ class DraftModelSpeculator(BaseSpeculator):
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # Agreed batch geometry from the most recent main-model DP sync. A
+        # dense drafter that skips its own dispatch all-reduce still dispatches
+        # against these padded values so every DP rank replays the same graph
+        # bucket as the main model.
+        self.dp_main_num_reqs: int | None = None
+        self.dp_main_num_tokens_across_dp: torch.Tensor | None = None
 
         self.eplb_state: EplbState | None = None
 
@@ -166,6 +172,15 @@ class DraftModelSpeculator(BaseSpeculator):
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""
         self.eplb_state = eplb_state
+
+    def set_dp_batch(
+        self,
+        num_reqs_across_dp: int | None,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> None:
+        """Record the padded batch agreed by the main model's DP dispatch."""
+        self.dp_main_num_reqs = num_reqs_across_dp
+        self.dp_main_num_tokens_across_dp = num_tokens_across_dp
 
     def _prepare_eplb_forward(self, num_unpadded_tokens: int) -> None:
         """Call EPLB prepare_forward if EPLB is active for the draft model."""

@@ -1426,6 +1426,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
         )
+        if self.speculator is not None:
+            setter = getattr(self.speculator, "set_dp_batch", None)
+            if setter is not None:
+                setter(
+                    batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs,
+                    num_tokens_across_dp,
+                )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
