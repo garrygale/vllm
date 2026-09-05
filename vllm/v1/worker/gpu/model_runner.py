@@ -1179,6 +1179,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        if uniform_tok_count is not None and not dummy_run:
+            # A chunked-prefill chunk can contain exactly decode_query_len
+            # tokens, so a shape-only uniform check can misclassify it as a
+            # uniform decode batch. Reject that path whenever any scheduled
+            # request is still in its prefill phase (vLLM #51865).
+            req_ids = sort_batch_req_ids(
+                scheduler_output.num_scheduled_tokens, self.decode_query_len
+            )
+            idx_mapping_np = np.fromiter(
+                map(self.req_states.req_id_to_index.get, req_ids),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+            num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
+                idx_mapping_np
+            ]
+            if np.any(num_computed_prefill_tokens_np < prefill_len_np):
+                uniform_tok_count = None
 
         num_active_loras = 0
         if self.lora_config:
