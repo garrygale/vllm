@@ -142,6 +142,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def _skip_draft_dp_sync(self) -> bool:
+        """Whether the draft dispatch can skip the cross-DP all-reduce.
+
+        DFlash/DSpark keep the sync because their draft backbones can be MoE
+        models whose EP collectives span the DP group. Dense Domino drafts run
+        no such cross-DP collectives, so the extra sync is unnecessary and can
+        deadlock when DP ranks are idle/active asymmetrically.
+        """
+        return False
+
     def load_draft_model(
         self,
         target_model: nn.Module,
@@ -408,15 +418,43 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-        )
+        if not is_profile and self._skip_draft_dp_sync():
+            # No cross-DP collective runs inside this drafter's forward, so
+            # dispatch against the local graph buckets only. Doing so removes
+            # the second per-step DP all-reduce that can deadlock when some DP
+            # ranks run dummy batches while others run real requests.
+            assert self.query_cudagraph_manager is not None
+            batch_desc = self.query_cudagraph_manager.dispatch(
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                num_active_loras=0,
+            )
+            # The main model's DP sync already established the per-rank batch
+            # cadence; this draft dispatch is local. Still give the draft's
+            # forward context a DP-shaped token-count tensor (the same shape
+            # the non-skip path would produce) so Ascend graph/attention paths
+            # that consult it do not take a different branch on idle ranks.
+            num_tokens_across_dp = (
+                torch.full(
+                    (self.dp_size,),
+                    num_query_tokens,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                if self.dp_size > 1
+                else None
+            )
+        else:
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=is_profile,
+            )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens

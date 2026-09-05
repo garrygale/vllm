@@ -66,6 +66,14 @@ class DominoSpeculator(DSparkSpeculator):
         # capture, so it is part of the same graph.
         super().init_cudagraph_manager(cudagraph_mode)
 
+    def _skip_draft_dp_sync(self) -> bool:
+        # The Domino draft backbone is a dense transformer with no MoE/EP
+        # layers, so its proposal forward runs no cross-DP collectives. Skip
+        # the second per-step DP dispatch all-reduce inherited from DFlash;
+        # that all-reduce can deadlock when DP ranks are not all executing a
+        # real batch (e.g. idle ranks running dummy batches).
+        return True
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
