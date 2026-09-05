@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -11,6 +13,20 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
+
+
+def dp_trace(scope: str, rank: int | None = None, **fields) -> None:
+    """Emit one line when VLLM_DP_TRACE is set (1 = coarse, 2 = verbose)."""
+    level = os.environ.get("VLLM_DP_TRACE", "0")
+    if not level or level == "0":
+        return
+    if level == "1" and fields.get("verbose"):
+        return
+    detail = " ".join(f"{k}={v}" for k, v in fields.items() if k != "verbose")
+    print(
+        f"[VLLM_DP_TRACE] pid={os.getpid()} rank={rank} {scope} {detail}",
+        flush=True,
+    )
 
 
 def sync_cudagraph_and_dp_padding(
@@ -30,6 +46,14 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
+    dp_trace(
+        "sync_cg_dp_enter",
+        rank=dp_rank,
+        num_tokens=num_tokens,
+        num_reqs=num_reqs,
+        cg_mode=desired_batch_desc.cg_mode.value,
+        uniform=uniform_token_count,
+    )
     tensor = torch.zeros(3, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
@@ -40,16 +64,24 @@ def sync_cudagraph_and_dp_padding(
     cg_mode_across_dp = tensor[1]
     uniform_token_counts_across_dp = tensor[2]
 
+    dp_trace(
+        "sync_cg_dp_allreduce_done",
+        rank=dp_rank,
+        num_tokens_across=list(num_tokens_across_dp.tolist()),
+    )
+
     if torch.all(num_tokens_across_dp == 0).item():
         synced_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=0, num_reqs=0
         )
+        dp_trace("sync_cg_dp_exit_empty", rank=dp_rank)
         return synced_desc, None
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
 
     # If any rank wants to run eager, all ranks run eager
     if synced_cg_mode == CUDAGraphMode.NONE:
+        dp_trace("sync_cg_dp_exit_eager", rank=dp_rank)
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
@@ -82,6 +114,12 @@ def sync_cudagraph_and_dp_padding(
     # Update num_tokens_across_dp to reflect padded size.
     num_tokens_across_dp[:] = synced_desc.num_tokens
 
+    dp_trace(
+        "sync_cg_dp_exit",
+        rank=dp_rank,
+        synced_num_tokens=synced_num_tokens,
+        uniform=synced_uniform_token_count,
+    )
     return synced_desc, num_tokens_across_dp
 
 

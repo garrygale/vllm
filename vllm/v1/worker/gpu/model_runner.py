@@ -71,7 +71,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
     get_uniform_token_count,
 )
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp, dp_trace
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
@@ -542,6 +542,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        dp_trace(
+            "model_runner.dummy_run_enter",
+            rank=getattr(self, "dp_rank", None),
+            num_tokens=num_tokens,
+            uniform_decode=uniform_decode,
+            is_profile=is_profile,
+        )
         if skip_attn and not is_profile:
             raise ValueError(
                 "skip_attn must only be True for initial memory profiling."
@@ -650,6 +657,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
                 is_profile=is_profile,
             )
+        dp_trace(
+            "model_runner.dummy_run_after_propose",
+            rank=getattr(self, "dp_rank", None),
+            num_tokens=num_tokens,
+            num_reqs=input_batch.num_reqs,
+        )
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
@@ -1161,6 +1174,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        dp_trace(
+            "model_runner.execute_model_enter",
+            rank=getattr(self, "dp_rank", None),
+            dummy_run=dummy_run,
+            scheduled_tokens=(
+                scheduler_output.total_num_scheduled_tokens
+                if scheduler_output is not None
+                else None
+            ),
+        )
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1203,6 +1226,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
+        )
+        dp_trace(
+            "model_runner.execute_model_after_dispatch",
+            rank=getattr(self, "dp_rank", None),
+            dummy_run=dummy_run,
+            desc_tokens=batch_desc.num_tokens,
+            desc_reqs=batch_desc.num_reqs,
+            cg_mode=batch_desc.cg_mode.value,
+            verbose=1,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1405,6 +1437,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
+        dp_trace(
+            "model_runner.sample_tokens_enter",
+            rank=getattr(self, "dp_rank", None),
+        )
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -1503,6 +1539,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+        dp_trace(
+            "model_runner.sample_tokens_after_postprocess",
+            rank=getattr(self, "dp_rank", None),
+            num_reqs=input_batch.num_reqs,
+        )
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1527,6 +1568,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+            )
+            dp_trace(
+                "model_runner.sample_tokens_after_propose",
+                rank=getattr(self, "dp_rank", None),
+                num_reqs=input_batch.num_reqs,
+                draft_shape=list(draft_tokens.shape),
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 

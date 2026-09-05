@@ -16,7 +16,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp, dp_trace
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
@@ -324,6 +324,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
+        dp_trace(
+            "dflash.propose_enter",
+            rank=getattr(self, "dp_rank", None),
+            num_reqs=num_reqs,
+            num_target_tokens=num_target_tokens,
+            num_query_tokens=num_query_tokens,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
+        )
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
@@ -455,6 +465,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                 dp_rank=self.dp_rank,
                 need_eager=is_profile,
             )
+        dp_trace(
+            "dflash.propose_after_dispatch",
+            rank=getattr(self, "dp_rank", None),
+            dummy_run=dummy_run,
+            desc_tokens=batch_desc.num_tokens,
+            desc_reqs=batch_desc.num_reqs,
+            cg_mode=batch_desc.cg_mode.value,
+            num_tokens_across=(
+                num_tokens_across_dp.tolist()
+                if num_tokens_across_dp is not None
+                else None
+            ),
+        )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
@@ -478,7 +501,17 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
+            dp_trace(
+                "dflash.run_fullgraph_enter",
+                rank=getattr(self, "dp_rank", None),
+                num_tokens=num_tokens_padded,
+                num_reqs=num_reqs_padded,
+            )
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            dp_trace(
+                "dflash.run_fullgraph_exit",
+                rank=getattr(self, "dp_rank", None),
+            )
         else:
             self._generate_draft(
                 num_reqs,
@@ -489,6 +522,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        dp_trace(
+            "dflash.propose_exit",
+            rank=getattr(self, "dp_rank", None),
+            num_reqs=num_reqs,
+        )
         return self.draft_tokens[:num_reqs]
 
 
