@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -15,16 +16,25 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 
 
+_DP_TRACE_LEVEL = os.environ.get("VLLM_DP_TRACE", "0")
+if _DP_TRACE_LEVEL not in ("", "0"):
+    print(
+        f"[VLLM_DP_TRACE] pid={os.getpid()} dp_utils loaded level={_DP_TRACE_LEVEL}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def dp_trace(scope: str, rank: int | None = None, **fields) -> None:
     """Emit one line when VLLM_DP_TRACE is set (1 = coarse, 2 = verbose)."""
-    level = os.environ.get("VLLM_DP_TRACE", "0")
-    if not level or level == "0":
+    if _DP_TRACE_LEVEL in ("", "0"):
         return
-    if level == "1" and fields.get("verbose"):
+    if _DP_TRACE_LEVEL == "1" and fields.get("verbose"):
         return
     detail = " ".join(f"{k}={v}" for k, v in fields.items() if k != "verbose")
     print(
         f"[VLLM_DP_TRACE] pid={os.getpid()} rank={rank} {scope} {detail}",
+        file=sys.stderr,
         flush=True,
     )
 
