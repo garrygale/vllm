@@ -90,16 +90,6 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 
-def _dp_trace(scope: str, rank: int | None = None, **fields) -> None:
-    """Lazily import the shared DP trace helper to keep engine imports light."""
-    try:
-        from vllm.v1.worker.gpu.dp_utils import dp_trace
-
-        dp_trace(scope, rank=rank, **fields)
-    except Exception:
-        pass
-
-
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
@@ -2051,12 +2041,6 @@ class DPEngineCoreProc(EngineCoreProc):
 
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
-            _dp_trace(
-                "engine.process_step_done",
-                rank=getattr(self, "dp_rank", None),
-                executed=executed,
-                step=self.step_counter,
-            )
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
             if not executed:
@@ -2068,17 +2052,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 # engine is sleeping.
                 elif not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
-                        _dp_trace(
-                            "engine.execute_dummy_enter",
-                            rank=getattr(self, "dp_rank", None),
-                            step=self.step_counter,
-                        )
                         self.execute_dummy_batch()
-                        _dp_trace(
-                            "engine.execute_dummy_exit",
-                            rank=getattr(self, "dp_rank", None),
-                            step=self.step_counter,
-                        )
                     if iteration_details is not None and not self.has_coordinator:
                         stats = self._make_iteration_details_stats(iteration_details)
                         self.output_queue.put_nowait(
@@ -2118,23 +2092,10 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
-        _dp_trace(
-            "engine.global_unfinished_enter",
-            rank=getattr(self, "dp_rank", None),
-            step=self.step_counter,
-            local_unfinished=local_unfinished,
-        )
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
             has_unfinished=local_unfinished,
             pending_pause=self.pending_pause,
-        )
-        _dp_trace(
-            "engine.global_unfinished_exit",
-            rank=getattr(self, "dp_rank", None),
-            step=self.step_counter,
-            has_unfinished=has_unfinished,
-            pause_consensus=pause_consensus,
         )
 
         if pause_consensus:
