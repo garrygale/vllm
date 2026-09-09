@@ -134,22 +134,23 @@ class DominoDraftAttention(Attention):
     Sliding-window draft layers keep the full context in the KV cache: the
     DFlash contract precomputes and rewrites the entire context K/V every
     step through position-aligned block tables, which window-block eviction
-    would break.  The sliding window is still applied at compute time via
-    the ``sliding_window`` carried on the full-attention spec/metadata.
+    would break.  The cache allocation and manager must therefore see a
+    single, ordinary full-attention layout for every draft layer.  The
+    per-layer window is still applied at compute time through
+    ``per_layer_sliding_window`` on the Attention implementation.
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
         if isinstance(spec, SlidingWindowSpec):
             return FullAttentionSpec(
-                block_size=spec.block_size,
+                block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=spec.num_kv_heads,
                 head_size=spec.head_size,
                 head_size_v=spec.head_size_v,
                 dtype=spec.dtype,
                 kv_quant_mode=spec.kv_quant_mode,
-                sliding_window=spec.sliding_window,
-                page_size_padded=spec.page_size_padded,
+                sliding_window=None,
             )
         return spec
 

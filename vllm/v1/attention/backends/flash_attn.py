@@ -932,17 +932,15 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
-                window = (
-                    attn_metadata.sliding_window
-                    if attn_metadata.sliding_window is not None
-                    else self.sliding_window
-                )
+                causal = attn_metadata.causal
+                is_dynamic_causal = isinstance(causal, torch.Tensor)
+                # The layer's own window wins over the KV cache group's.
+                # Draft SWA layers share a full-attention allocation group,
+                # so the group spec intentionally carries no window.
+                window = _maybe_symmetrize_window(self.sliding_window, causal)
                 sliding_window_size: list[int] | None = (
                     list(window) if window is not None else None
                 )
-
-                causal = attn_metadata.causal
-                is_dynamic_causal = isinstance(causal, torch.Tensor)
 
                 mm_prefix_ranges = attn_metadata.mm_prefix_range_tensor
                 mm_mask_mod = None
