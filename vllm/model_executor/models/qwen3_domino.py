@@ -441,9 +441,9 @@ class FoldedSoftmaxReadout(nn.Module):
         chunks = hidden_states.reshape(
             *lead, self.branches, self.repeats, self.granularity
         )
-        weights = torch.softmax(self.fold_logits.float(), dim=0).to(
-            hidden_states.dtype
-        )
+        # Same dtype handling as the flare fusion weights: the logits are
+        # loaded in the model dtype, so softmax runs there directly.
+        weights = torch.softmax(self.fold_logits, dim=0)
         mixed = (
             chunks * weights.view(self.branches, 1, self.granularity)
         ).sum(dim=-3)
