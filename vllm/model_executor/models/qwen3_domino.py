@@ -28,6 +28,7 @@ from vllm.config import VllmConfig, get_current_vllm_config, replace
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -387,7 +388,16 @@ def resolve_folded_readout(config) -> tuple[int, int] | None:
 
 
 class FoldedSoftmaxReadout(nn.Module):
-    """Softmax chunk mixture followed by a dense ``folded -> hidden`` map."""
+    """Softmax chunk mixture followed by a dense ``folded -> hidden`` map.
+
+    Tensor parallelism: the gated hidden arrives sharded, rank ``r`` holding
+    intermediate positions ``[r*M/tp, (r+1)*M/tp)``, while each folded slot
+    ``y[q]`` sums ``c`` positions that generally live on different ranks.  Each
+    rank therefore computes its *partial* mixture over the ``s`` slots using
+    only its own positions, the partials are summed with a single all-reduce
+    over that (small) ``s``-wide vector, and the dense projection stays the
+    usual row-parallel layer, which all-reduces the output as before.
+    """
 
     def __init__(
         self,
@@ -412,14 +422,11 @@ class FoldedSoftmaxReadout(nn.Module):
                 f"folded width {folded_size}"
             )
         tp_size = get_tensor_model_parallel_world_size()
-        if tp_size > 1:
-            # The mixture needs every chunk of the gated hidden; with a
-            # column-parallel gate_up_proj the chunks live on different ranks,
-            # so this would need a partial-sum + all-reduce implementation.
-            raise NotImplementedError(
-                "the folded softmax readout requires "
-                f"draft_tensor_parallel_size=1 (got {tp_size}); use the dense "
-                "down_proj or add the sharded mixture first"
+        if intermediate_size % tp_size or folded_size % tp_size:
+            raise ValueError(
+                "folded readout needs tensor_parallel_size to divide both "
+                f"intermediate_size={intermediate_size} and the folded width="
+                f"{folded_size}; got tp={tp_size}"
             )
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -427,6 +434,10 @@ class FoldedSoftmaxReadout(nn.Module):
         self.granularity = granularity
         self.folded_size = folded_size
         self.repeats = folded_size // granularity
+        self.tp_size = tp_size
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.local_hidden_size = intermediate_size // tp_size
+        self.aligned_shards = True
         self.proj = RowParallelLinear(
             folded_size,
             hidden_size,
@@ -434,20 +445,106 @@ class FoldedSoftmaxReadout(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
         )
+        self.local_input_size = self.proj.input_size_per_partition
+        if self.local_input_size != folded_size // tp_size:
+            raise ValueError(
+                "RowParallelLinear sharded its input differently than the "
+                "folded readout assumes "
+                f"({self.local_input_size} != {folded_size // tp_size})"
+            )
         self.fold_logits = nn.Parameter(torch.zeros(branches, granularity))
+        if tp_size > 1:
+            self._init_tp_mixture()
+
+    def _init_tp_mixture(self) -> None:
+        """Precompute the static position -> folded-slot map for this rank.
+
+        When ``tp`` divides the branch count, every rank owns whole chunks and
+        the mixture is a reshape plus a weighted sum.  Otherwise a rank owns a
+        partial chunk, which needs the scatter form.
+        """
+
+        self.aligned_shards = (
+            self.local_hidden_size % self.folded_size == 0
+            and self.branches % self.tp_size == 0
+        )
+        self.register_buffer(
+            "slot_offsets",
+            torch.arange(self.folded_size) % self.granularity,
+            persistent=False,
+        )
+        if self.aligned_shards:
+            per_rank = self.branches // self.tp_size
+            first = self.tp_rank * per_rank
+            self.register_buffer(
+                "local_chunks",
+                torch.arange(first, first + per_rank),
+                persistent=False,
+            )
+            return
+        positions = torch.arange(
+            self.tp_rank * self.local_hidden_size,
+            (self.tp_rank + 1) * self.local_hidden_size,
+        )
+        self.register_buffer(
+            "shard_branches", positions // self.folded_size, persistent=False
+        )
+        self.register_buffer(
+            "shard_slots", positions % self.folded_size, persistent=False
+        )
+        self.register_buffer(
+            "shard_offsets",
+            (positions % self.folded_size) % self.granularity,
+            persistent=False,
+        )
+
+    def _local_mixture(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Partial mixture over this rank's shard, ``[..., folded_size]`` wide."""
+
+        if hidden_states.shape[-1] != self.local_hidden_size:
+            raise ValueError(
+                f"expected a {self.local_hidden_size}-wide gated hidden shard "
+                f"(tp={self.tp_size}), got {tuple(hidden_states.shape)}"
+            )
+        weights = torch.softmax(self.fold_logits, dim=0)
+        if self.aligned_shards:
+            chunks = hidden_states.reshape(
+                -1, self.local_chunks.numel(), self.folded_size
+            )
+            pattern = weights[self.local_chunks][:, self.slot_offsets]
+            return (chunks * pattern).sum(dim=1)
+        scaled = hidden_states.reshape(
+            -1, self.local_hidden_size
+        ) * weights[self.shard_branches, self.shard_offsets]
+        partial = torch.zeros(
+            scaled.shape[0],
+            self.folded_size,
+            dtype=scaled.dtype,
+            device=scaled.device,
+        )
+        partial.index_add_(1, self.shard_slots, scaled)
+        return partial
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         lead = hidden_states.shape[:-1]
-        chunks = hidden_states.reshape(
-            *lead, self.branches, self.repeats, self.granularity
-        )
-        # Same dtype handling as the flare fusion weights: the logits are
-        # loaded in the model dtype, so softmax runs there directly.
-        weights = torch.softmax(self.fold_logits, dim=0)
-        mixed = (
-            chunks * weights.view(self.branches, 1, self.granularity)
-        ).sum(dim=-3)
-        mixed = mixed.reshape(*lead, self.folded_size)
+        if self.tp_size == 1:
+            chunks = hidden_states.reshape(
+                *lead, self.branches, self.repeats, self.granularity
+            )
+            # Same dtype handling as the flare fusion weights: the logits are
+            # loaded in the model dtype, so softmax runs there directly.
+            weights = torch.softmax(self.fold_logits, dim=0)
+            mixed = (
+                chunks * weights.view(self.branches, 1, self.granularity)
+            ).sum(dim=-3)
+            mixed = mixed.reshape(*lead, self.folded_size)
+        else:
+            folded = tensor_model_parallel_all_reduce(
+                self._local_mixture(hidden_states)
+            )
+            start = self.tp_rank * self.local_input_size
+            mixed = folded[..., start : start + self.local_input_size]
+            mixed = mixed.reshape(*lead, self.local_input_size)
         output, _ = self.proj(mixed)
         return output
 

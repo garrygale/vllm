@@ -128,6 +128,10 @@ def test_folded_readout_mixture_matches_the_training_formula():
     readout.granularity = 2
     readout.folded_size = 4
     readout.repeats = 2
+    readout.tp_size = 1
+    readout.tp_rank = 0
+    readout.local_hidden_size = 12
+    readout.local_input_size = 4
     readout.fold_logits = torch.nn.Parameter(torch.randn(3, 2))
     readout.proj = torch.nn.Linear(4, 4, bias=False)
 
@@ -178,3 +182,75 @@ def test_folded_softmax_mlp_shapes_and_names(
         mixed, mlp.down_proj.proj.weight
     )
     assert torch.allclose(mlp(hidden_states), expected, atol=1e-2)
+
+
+# (hidden, intermediate, branches, granularity, tp) -- the first two divide tp
+# into whole chunks, the last two leave a rank with a partial chunk, which
+# switches the readout onto its scatter path.
+TP_CASES = (
+    (8, 32, 4, 8, 2),
+    (8, 32, 4, 8, 4),
+    (8, 96, 3, 8, 2),
+    (8, 64, 4, 8, 8),
+)
+
+
+def _rank_readout(hidden, intermediate, branches, granularity, rank, tp):
+    """One rank's readout with the distributed bits filled in by hand."""
+
+    readout = object.__new__(FoldedSoftmaxReadout)
+    torch.nn.Module.__init__(readout)
+    readout.hidden_size = hidden
+    readout.intermediate_size = intermediate
+    readout.branches = branches
+    readout.granularity = granularity
+    readout.folded_size = intermediate // branches
+    readout.repeats = readout.folded_size // granularity
+    readout.tp_size = tp
+    readout.tp_rank = rank
+    readout.local_hidden_size = intermediate // tp
+    readout.local_input_size = readout.folded_size // tp
+    readout.proj = _StubRowParallelLinear(readout.local_input_size, hidden)
+    readout.fold_logits = torch.nn.Parameter(
+        torch.zeros(branches, granularity)
+    )
+    readout._init_tp_mixture()
+    return readout
+
+
+def test_sharded_mixture_reconstructs_the_unsharded_formula():
+    for hidden, intermediate, branches, granularity, tp in TP_CASES:
+        with torch.inference_mode():
+            torch.manual_seed(hidden + intermediate + tp)
+            folded_size = intermediate // branches
+            logits = torch.randn(branches, granularity)
+            gated = torch.randn(2, 5, intermediate)
+
+            # Reference: one rank holding the whole gated hidden.
+            weights = torch.softmax(logits, dim=0)
+            offsets = torch.arange(folded_size) % granularity
+            chunks = gated.reshape(2, 5, branches, folded_size)
+            expected = (chunks * weights[:, offsets]).sum(dim=2)
+
+            partials = []
+            for rank in range(tp):
+                readout = _rank_readout(
+                    hidden, intermediate, branches, granularity, rank, tp
+                )
+                readout.fold_logits.copy_(logits)
+                width = intermediate // tp
+                local = gated[..., rank * width : (rank + 1) * width]
+                partials.append(readout._local_mixture(local))
+
+            # Whole-chunk shards use the reshape path, partial shards the
+            # scatter path; make sure both are actually covered.
+            aligned = (branches % tp == 0) and (
+                (intermediate // tp) % folded_size == 0
+            )
+            assert _rank_readout(
+                hidden, intermediate, branches, granularity, 0, tp
+            ).aligned_shards == aligned
+
+            # The all-reduce the module performs is just a sum over ranks.
+            total = torch.stack(partials).sum(dim=0).reshape(2, 5, folded_size)
+            assert torch.allclose(total, expected, atol=1e-5)
