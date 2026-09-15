@@ -30,10 +30,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -297,6 +299,201 @@ class DominoQwen3Attention(nn.Module):
         return output
 
 
+# ---------------------------------------------------------------------------
+# Folded softmax FFN readout (``dflash_config.ffn_readout``)
+# ---------------------------------------------------------------------------
+#
+# Serving counterpart of the training knob in
+# ``specforge/modeling/draft/dflash_kernels.py``.  The dense ``down_proj``
+# (intermediate_size -> hidden_size) becomes a softmax-normalized mixture over
+# ``branches`` contiguous chunks of the gated hidden, followed by a dense
+# ``folded_size -> hidden_size`` projection:
+#
+#     y[q] = sum_j softmax_j(logits[j, q % K]) * h[j * s + q]      s = M / c
+#     out  = W y
+#
+# The mixture itself has no learned mixing matrix (only ``c * K`` logits) and
+# stays in the activation dtype — it is a vector product plus a sum.  Only the
+# trailing projection is a ``RowParallelLinear``, so it quantizes exactly like
+# the dense ``down_proj`` it replaces.
+
+_FOLDED_READOUT_MODES = frozenset({"folded", "folded_softmax", "softmax_fold"})
+_FOLDED_READOUT_DEFAULT_GRANULARITY = 16
+
+
+def _nearest_divisor(value: int, target: int) -> int:
+    divisors = [d for d in range(2, min(value, 1024) + 1) if value % d == 0]
+    if not divisors:
+        return 1
+    return min(divisors, key=lambda d: (abs(d - target), d))
+
+
+def resolve_folded_readout(config) -> tuple[int, int] | None:
+    """Resolve ``(branches, granularity)``; ``None`` keeps the dense readout.
+
+    Must mirror the training-side resolver: a config that only says
+    ``"ffn_readout": "folded_softmax"`` resolves to the same shapes here as it
+    did in SpecForge.
+    """
+
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    raw = dflash_config.get("ffn_readout")
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, str):
+        mode, spec = raw, {}
+    elif isinstance(raw, dict):
+        spec = dict(raw)
+        mode = spec.pop("mode", "folded_softmax")
+    else:
+        raise ValueError(
+            "dflash_config.ffn_readout must be a mode string or a dict, got "
+            f"{type(raw).__name__}"
+        )
+    if mode in {"dense", "off", "none"}:
+        return None
+    if mode not in _FOLDED_READOUT_MODES:
+        raise ValueError(
+            f"unsupported dflash_config.ffn_readout mode {mode!r}; expected one "
+            f"of {sorted(_FOLDED_READOUT_MODES)} or 'dense'"
+        )
+
+    hidden_size = int(getattr(config, "hidden_size", 0) or 0)
+    intermediate_size = int(getattr(config, "intermediate_size", 0) or 0)
+    if hidden_size <= 0 or intermediate_size <= 0:
+        raise ValueError(
+            "folded readout needs positive hidden_size and intermediate_size"
+        )
+    if "branches" in spec:
+        branches = int(spec["branches"])
+    else:
+        ratio = max(2, int(round(intermediate_size / hidden_size)))
+        branches = _nearest_divisor(intermediate_size, ratio)
+    if branches < 1 or intermediate_size % branches:
+        raise ValueError(
+            f"folded readout branches={branches} must divide "
+            f"intermediate_size={intermediate_size}"
+        )
+    granularity = int(
+        spec.get("granularity", _FOLDED_READOUT_DEFAULT_GRANULARITY)
+    )
+    folded_size = intermediate_size // branches
+    if granularity < 1 or folded_size % granularity:
+        raise ValueError(
+            f"folded readout granularity={granularity} must divide the folded "
+            f"width intermediate_size / branches = {folded_size}"
+        )
+    return branches, granularity
+
+
+class FoldedSoftmaxReadout(nn.Module):
+    """Softmax chunk mixture followed by a dense ``folded -> hidden`` map."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        branches: int,
+        granularity: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if branches < 1 or intermediate_size % branches:
+            raise ValueError(
+                f"folded readout branches={branches} must divide "
+                f"intermediate_size={intermediate_size}"
+            )
+        folded_size = intermediate_size // branches
+        if granularity < 1 or folded_size % granularity:
+            raise ValueError(
+                f"folded readout granularity={granularity} must divide the "
+                f"folded width {folded_size}"
+            )
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            # The mixture needs every chunk of the gated hidden; with a
+            # column-parallel gate_up_proj the chunks live on different ranks,
+            # so this would need a partial-sum + all-reduce implementation.
+            raise NotImplementedError(
+                "the folded softmax readout requires "
+                f"draft_tensor_parallel_size=1 (got {tp_size}); use the dense "
+                "down_proj or add the sharded mixture first"
+            )
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.branches = branches
+        self.granularity = granularity
+        self.folded_size = folded_size
+        self.repeats = folded_size // granularity
+        self.proj = RowParallelLinear(
+            folded_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj",
+        )
+        self.fold_logits = nn.Parameter(torch.zeros(branches, granularity))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        lead = hidden_states.shape[:-1]
+        chunks = hidden_states.reshape(
+            *lead, self.branches, self.repeats, self.granularity
+        )
+        weights = torch.softmax(self.fold_logits.float(), dim=0).to(
+            hidden_states.dtype
+        )
+        mixed = (
+            chunks * weights.view(self.branches, 1, self.granularity)
+        ).sum(dim=-3)
+        mixed = mixed.reshape(*lead, self.folded_size)
+        output, _ = self.proj(mixed)
+        return output
+
+
+class FoldedSoftmaxMLP(nn.Module):
+    """``Qwen3MLP`` whose ``down_proj`` is a :class:`FoldedSoftmaxReadout`."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        branches: int,
+        granularity: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = FoldedSoftmaxReadout(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            branches=branches,
+            granularity=granularity,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        return self.down_proj(self.act_fn(gate_up))
+
+
 class DominoQwen3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -330,13 +527,26 @@ class DominoQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = Qwen3MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
+        folded_readout = resolve_folded_readout(config)
+        if folded_readout is None:
+            self.mlp = Qwen3MLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        else:
+            branches, granularity = folded_readout
+            self.mlp = FoldedSoftmaxMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                branches=branches,
+                granularity=granularity,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
