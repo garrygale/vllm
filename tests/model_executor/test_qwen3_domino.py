@@ -12,8 +12,12 @@ from vllm.model_executor.models.qwen3_domino import (
     DominoDraftAttention,
     FoldedSoftmaxMLP,
     FoldedSoftmaxReadout,
+    Qwen3DominoModel,
+    SharedGLUMLP,
+    resolve_ffn_sharing,
     resolve_folded_readout,
 )
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
@@ -178,3 +182,200 @@ def test_folded_softmax_mlp_shapes_and_names(
         mixed, mlp.down_proj.proj.weight
     )
     assert torch.allclose(mlp(hidden_states), expected, atol=1e-2)
+
+
+def test_resolve_ffn_sharing_defaults_match_training():
+    # No knob keeps today's Qwen3MLP; each side defaults to no sharing.
+    assert resolve_ffn_sharing(_draft_config()) is None
+    assert resolve_ffn_sharing(_draft_config(dflash_config={"ffn_sharing": None})) is None
+    assert resolve_ffn_sharing(_draft_config(dflash_config={"ffn_sharing": False})) is None
+    # Pure gate sharing k=2 on the 35B-A3B draft.
+    assert resolve_ffn_sharing(
+        _draft_config(dflash_config={"ffn_sharing": {"gate_groups": 4864}})
+    ) == ("nested", 4864, 9728)
+    # The exactly-once outer lattice that keeps 9728 = 76 * 128.
+    assert resolve_ffn_sharing(
+        _draft_config(
+            dflash_config={
+                "ffn_sharing": {"pairing": "outer", "gate_groups": 76, "up_groups": 128}
+            }
+        )
+    ) == ("outer", 76, 128)
+
+
+def test_resolve_ffn_sharing_rejects_invalid_knobs():
+    with pytest.raises(ValueError):
+        resolve_ffn_sharing(_draft_config(dflash_config={"ffn_sharing": "gate"}))
+    with pytest.raises(ValueError):
+        resolve_ffn_sharing(
+            _draft_config(dflash_config={"ffn_sharing": {"pairing_k": "nested"}})
+        )
+    with pytest.raises(ValueError):
+        resolve_ffn_sharing(
+            _draft_config(dflash_config={"ffn_sharing": {"pairing": "weave"}})
+        )
+    with pytest.raises(ValueError):
+        resolve_ffn_sharing(_draft_config(dflash_config={"ffn_sharing": {"gate_groups": 5}}))
+    with pytest.raises(ValueError):
+        resolve_ffn_sharing(_draft_config(dflash_config={"ffn_sharing": {"gate_groups": 9729}}))
+
+
+def test_resolve_ffn_sharing_outer_error_suggests_factorizations():
+    with pytest.raises(ValueError, match="4096") as ctx:
+        resolve_ffn_sharing(
+            _draft_config(
+                dflash_config={
+                    "ffn_sharing": {
+                        "pairing": "outer",
+                        "gate_groups": 64,
+                        "up_groups": 64,
+                    }
+                }
+            )
+        )
+    assert "76x128" in str(ctx.value)
+
+
+class _MLPHolder(torch.nn.Module):
+    """Replicates Qwen3DominoModel's two-line stacked-mapper load path."""
+
+    hf_to_vllm_mapper = Qwen3DominoModel.hf_to_vllm_mapper
+
+    def __init__(self, mlp: torch.nn.Module) -> None:
+        super().__init__()
+        self.mlp = mlp
+
+    def load_weights(self, weights):
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "pairing,gate_groups,up_groups",
+    [("nested", 12, 24), ("nested", 12, 8), ("outer", 2, 12), ("outer", 2, 6)],
+)
+def test_shared_glu_mlp_matches_the_training_formula(
+    default_vllm_config, dist_init, device, pairing, gate_groups, up_groups
+) -> None:
+    """The served channel sharing must be the index math it trained as."""
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+
+    mlp = SharedGLUMLP(
+        hidden_size=8,
+        intermediate_size=24,
+        hidden_act="silu",
+        pairing=pairing,
+        gate_groups=gate_groups,
+        up_groups=up_groups,
+        prefix="layers.0.mlp",
+    )
+    parameters = dict(mlp.named_parameters())
+    assert parameters["gate_up_proj.weight"].shape == (
+        gate_groups + up_groups,
+        8,
+    )
+    assert parameters["down_proj.weight"].shape == (8, 24)
+    # The index maps are derived, not checkpointed.
+    assert "gate_idx" not in mlp.state_dict()
+    assert "up_idx" not in mlp.state_dict()
+
+    hidden_states = torch.randn(4, 8)
+    gate = torch.nn.functional.linear(
+        hidden_states, mlp.gate_up_proj.weight[:gate_groups]
+    )
+    up = torch.nn.functional.linear(
+        hidden_states, mlp.gate_up_proj.weight[gate_groups:]
+    )
+    expected_hidden = torch.nn.functional.silu(gate[..., mlp.gate_idx]) * up[
+        ..., mlp.up_idx
+    ]
+    expected = torch.nn.functional.linear(expected_hidden, mlp.down_proj.weight)
+    assert torch.allclose(mlp(hidden_states), expected, atol=1e-5)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+def test_shared_glu_mlp_composes_with_the_folded_readout(
+    default_vllm_config, dist_init, device
+) -> None:
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+
+    mlp = SharedGLUMLP(
+        hidden_size=8,
+        intermediate_size=24,
+        hidden_act="silu",
+        gate_groups=12,
+        up_groups=24,
+        folded_readout=(3, 4),
+        prefix="layers.0.mlp",
+    )
+    assert isinstance(mlp.down_proj, FoldedSoftmaxReadout)
+    assert mlp.down_proj.proj.weight.shape == (8, 8)
+    assert mlp.down_proj.fold_logits.shape == (3, 4)
+    assert mlp(torch.randn(4, 8)).shape == (4, 8)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+def test_shared_glu_mlp_loads_a_specforge_export(
+    default_vllm_config, dist_init, device
+) -> None:
+    """Separate unequal gate/up checkpoint keys land in the fused halves."""
+
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+
+    torch.manual_seed(0)
+    mlp = SharedGLUMLP(
+        hidden_size=8,
+        intermediate_size=24,
+        hidden_act="silu",
+        gate_groups=12,
+        up_groups=24,
+        prefix="layers.0.mlp",
+    )
+    holder = _MLPHolder(mlp)
+    gate_w = torch.randn(12, 8)
+    up_w = torch.randn(24, 8)
+    down_w = torch.randn(8, 24)
+    holder.load_weights(
+        [
+            ("mlp.gate_proj.weight", gate_w),
+            ("mlp.up_proj.weight", up_w),
+            ("mlp.down_proj.weight", down_w),
+        ]
+    )
+    assert torch.allclose(mlp.gate_up_proj.weight, torch.cat([gate_w, up_w]))
+
+    hidden_states = torch.randn(4, 8)
+    gate = torch.nn.functional.linear(hidden_states, gate_w)
+    up = torch.nn.functional.linear(hidden_states, up_w)
+    expected_hidden = torch.nn.functional.silu(gate[..., mlp.gate_idx]) * up[
+        ..., mlp.up_idx
+    ]
+    expected = torch.nn.functional.linear(expected_hidden, down_w)
+    assert torch.allclose(mlp(hidden_states), expected, atol=1e-5)
+
+
+def test_shared_glu_mlp_rejects_tensor_parallel_drafts():
+    with patch(
+        "vllm.model_executor.models.qwen3_domino."
+        "get_tensor_model_parallel_world_size",
+        return_value=2,
+    ):
+        with pytest.raises(NotImplementedError, match="draft_tensor_parallel_size"):
+            SharedGLUMLP(
+                hidden_size=8,
+                intermediate_size=24,
+                hidden_act="silu",
+                gate_groups=12,
+                up_groups=24,
+                prefix="layers.0.mlp",
+            )

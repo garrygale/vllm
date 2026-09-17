@@ -494,6 +494,199 @@ class FoldedSoftmaxMLP(nn.Module):
         return self.down_proj(self.act_fn(gate_up))
 
 
+# ---------------------------------------------------------------------------
+# Shared gate/up projections (``dflash_config.ffn_sharing``)
+# ---------------------------------------------------------------------------
+#
+# Serving counterpart of the training knob in
+# ``specforge/modeling/draft/dflash_kernels.py``.  ``gate_proj``/``up_proj``
+# shrink to ``gate_groups``/``up_groups`` unique channels fused into one
+# ``MergedColumnParallelLinear`` (the stacked weight loader places the two
+# halves by their own sizes, so unequal shapes and SpecForge exports with
+# separate ``gate_proj``/``up_proj`` weights load as-is), and intermediate
+# channel ``j`` pairs them through precomputed index maps:
+#
+#     h_j = silu( gate[gate_idx[j]] ) * up[up_idx[j]]
+#
+#     nested:  gate_idx[j] = j // (M / G_g),   up_idx[j] = j // (M / G_u)
+#     outer:   gate_idx[j] = j % G_g,           up_idx[j] = (j // G_g) % G_u
+#
+# ``down_proj`` is untouched (dense, or the folded readout above when
+# ``ffn_readout`` is also enabled).  TP > 1 is rejected: after column-parallel
+# sharding the channel gather reads gate/up channels owned by other ranks,
+# matching the folded readout's restriction.
+
+_SHARING_PAIRINGS = frozenset({"nested", "outer"})
+
+
+def _divisors(value: int) -> list[int]:
+    return [d for d in range(2, min(value, 1024) + 1) if value % d == 0]
+
+
+def resolve_ffn_sharing(config) -> tuple[str, int, int] | None:
+    """Resolve ``(pairing, gate_groups, up_groups)``; ``None`` keeps the
+    standard SwiGLU.
+
+    Must mirror the training-side resolver in SpecForge: the same config
+    resolves to the same shapes on both sides.
+    """
+
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    raw = dflash_config.get("ffn_sharing")
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "dflash_config.ffn_sharing must be a dict with 'pairing', "
+            f"'gate_groups' and 'up_groups', got {type(raw).__name__}"
+        )
+    spec = dict(raw)
+    unknown = sorted(set(spec) - {"pairing", "gate_groups", "up_groups"})
+    if unknown:
+        raise ValueError(
+            f"unknown dflash_config.ffn_sharing entries {unknown}; expected "
+            "'pairing', 'gate_groups' and 'up_groups'"
+        )
+    pairing = spec.get("pairing", "nested")
+    if pairing not in _SHARING_PAIRINGS:
+        raise ValueError(
+            f"unsupported dflash_config.ffn_sharing pairing {pairing!r}; "
+            f"expected one of {sorted(_SHARING_PAIRINGS)}"
+        )
+
+    intermediate_size = int(getattr(config, "intermediate_size", 0) or 0)
+    if intermediate_size <= 0:
+        raise ValueError("ffn sharing needs a positive intermediate_size")
+    gate_groups = int(spec.get("gate_groups", intermediate_size))
+    up_groups = int(spec.get("up_groups", intermediate_size))
+    for name, groups in (("gate_groups", gate_groups), ("up_groups", up_groups)):
+        if groups < 1 or groups > intermediate_size:
+            raise ValueError(
+                f"dflash_config.ffn_sharing.{name}={groups} must be between 1 "
+                f"and intermediate_size={intermediate_size}"
+            )
+    if pairing == "nested":
+        for name, groups in (("gate_groups", gate_groups), ("up_groups", up_groups)):
+            if intermediate_size % groups:
+                raise ValueError(
+                    f"nested sharing {name}={groups} must divide "
+                    f"intermediate_size={intermediate_size}"
+                )
+    elif intermediate_size % (gate_groups * up_groups):
+        pairs = sorted(
+            (
+                (d, intermediate_size // d)
+                for d in _divisors(intermediate_size)
+                if d <= intermediate_size // d
+            ),
+            key=lambda pair: abs(pair[0] - pair[1]),
+        )[:6]
+        raise ValueError(
+            f"outer sharing needs gate_groups * up_groups to divide "
+            f"intermediate_size, got {gate_groups} * {up_groups} = "
+            f"{gate_groups * up_groups} with intermediate_size="
+            f"{intermediate_size}; pick a factorization of "
+            f"{intermediate_size} (most balanced: "
+            f"{', '.join(f'{d}x{q}' for d, q in pairs)}) or change "
+            f"intermediate_size to {gate_groups * up_groups}"
+        )
+    return pairing, gate_groups, up_groups
+
+
+def _sharing_indices(
+    intermediate_size: int, gate_groups: int, up_groups: int, pairing: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    channel = torch.arange(intermediate_size)
+    if pairing == "nested":
+        gate_idx = channel // (intermediate_size // gate_groups)
+        up_idx = channel // (intermediate_size // up_groups)
+    else:  # outer
+        gate_idx = channel % gate_groups
+        up_idx = (channel // gate_groups) % up_groups
+    return gate_idx, up_idx
+
+
+class SharedGLUMLP(nn.Module):
+    """SwiGLU MLP whose fused gate/up halves serve multiple channels."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        pairing: str = "nested",
+        gate_groups: int,
+        up_groups: int,
+        folded_readout: tuple[int, int] | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
+            )
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            raise NotImplementedError(
+                "ffn sharing requires "
+                f"draft_tensor_parallel_size=1 (got {tp_size}); use the dense "
+                "gate/up projections or shard the gathered channels first"
+            )
+        self.intermediate_size = intermediate_size
+        self.gate_groups = gate_groups
+        self.up_groups = up_groups
+        self.pairing = pairing
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [gate_groups, up_groups],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        if folded_readout is None:
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.down_proj",
+            )
+        else:
+            branches, granularity = folded_readout
+            self.down_proj = FoldedSoftmaxReadout(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                branches=branches,
+                granularity=granularity,
+                quant_config=quant_config,
+                prefix=f"{prefix}.down_proj",
+            )
+        gate_idx, up_idx = _sharing_indices(
+            intermediate_size, gate_groups, up_groups, pairing
+        )
+        self.register_buffer("gate_idx", gate_idx, persistent=False)
+        self.register_buffer("up_idx", up_idx, persistent=False)
+
+    def shared_act(self, gate_up: torch.Tensor) -> torch.Tensor:
+        """SwiGLU over the fused ``[gate | up]`` halves with channel sharing.
+
+        Split out so the Ascend fused norm+quant path can reuse the exact
+        post-GEMM computation instead of the plain ``npu_swiglu`` halves.
+        """
+
+        gate = gate_up[..., : self.gate_groups]
+        up = gate_up[..., self.gate_groups :]
+        return F.silu(gate[..., self.gate_idx]) * up[..., self.up_idx]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        out = self.down_proj(self.shared_act(gate_up))
+        return out[0] if isinstance(out, tuple) else out
+
+
 class DominoQwen3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -528,7 +721,21 @@ class DominoQwen3DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         folded_readout = resolve_folded_readout(config)
-        if folded_readout is None:
+        sharing = resolve_ffn_sharing(config)
+        if sharing is not None:
+            pairing, gate_groups, up_groups = sharing
+            self.mlp = SharedGLUMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                pairing=pairing,
+                gate_groups=gate_groups,
+                up_groups=up_groups,
+                folded_readout=folded_readout,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        elif folded_readout is None:
             self.mlp = Qwen3MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
