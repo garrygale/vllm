@@ -17,6 +17,7 @@ uses per-draft-layer softmax fusion of the target hidden states
 """
 
 from collections.abc import Iterable
+import warnings
 
 import torch
 import torch.nn as nn
@@ -328,10 +329,12 @@ def _nearest_divisor(value: int, target: int) -> int:
     return min(divisors, key=lambda d: (abs(d - target), d))
 
 
-def resolve_folded_readout(config) -> tuple[int, int] | None:
-    """Resolve ``(branches, granularity)``; ``None`` keeps the dense readout.
+def resolve_folded_readout(config) -> tuple | None:
+    """Resolve the folded readout; ``None`` keeps the dense readout.
 
-    Must mirror the training-side resolver: a config that only says
+    Returns ``(branches, granularity, fold_axis, gate_groups, up_groups)``
+    (gate/up groups only under ``fold_axis='gate'``).  Must mirror the
+    training-side resolver: a config that only says
     ``"ffn_readout": "folded_softmax"`` resolves to the same shapes here as it
     did in SpecForge.
     """
@@ -341,14 +344,20 @@ def resolve_folded_readout(config) -> tuple[int, int] | None:
     if raw is None or raw is False:
         return None
     if isinstance(raw, str):
-        mode, spec = raw, {}
+        mode, spec, fold_axis = raw, {}, "channel"
     elif isinstance(raw, dict):
         spec = dict(raw)
         mode = spec.pop("mode", "folded_softmax")
+        fold_axis = spec.pop("fold_axis", "channel")
     else:
         raise ValueError(
             "dflash_config.ffn_readout must be a mode string or a dict, got "
             f"{type(raw).__name__}"
+        )
+    if fold_axis not in ("channel", "gate"):
+        raise ValueError(
+            f"dflash_config.ffn_readout.fold_axis must be 'channel' or "
+            f"'gate', got {fold_axis!r}"
         )
     if mode in {"dense", "off", "none"}:
         return None
@@ -369,7 +378,42 @@ def resolve_folded_readout(config) -> tuple[int, int] | None:
     else:
         ratio = max(2, int(round(intermediate_size / hidden_size)))
         branches = _nearest_divisor(intermediate_size, ratio)
-    if branches < 1 or intermediate_size % branches:
+    if branches < 1:
+        raise ValueError(
+            f"folded readout branches must be >= 1, got {branches}"
+        )
+
+    if fold_axis == "gate":
+        sharing = resolve_ffn_sharing(config)
+        if sharing is None or sharing[0] != "outer":
+            raise ValueError(
+                "fold_axis='gate' needs dflash_config.ffn_sharing with "
+                "pairing='outer' (the gate axis only exists on the lattice)"
+            )
+        _, gate_groups, up_groups = sharing
+        if intermediate_size != gate_groups * up_groups:
+            raise ValueError(
+                "gate-axis folding needs intermediate_size == gate_groups * "
+                f"up_groups, got {intermediate_size} vs "
+                f"{gate_groups} * {up_groups}"
+            )
+        if gate_groups % branches:
+            raise ValueError(
+                f"gate-axis branches={branches} must divide gate_groups="
+                f"{gate_groups}"
+            )
+        folded_gate = gate_groups // branches
+        granularity = int(
+            spec.get("granularity", _FOLDED_READOUT_DEFAULT_GRANULARITY)
+        )
+        if granularity < 1 or folded_gate % granularity:
+            raise ValueError(
+                f"gate-axis granularity={granularity} must divide the folded "
+                f"gate width gate_groups / branches = {folded_gate}"
+            )
+        return branches, granularity, "gate", gate_groups, up_groups
+
+    if intermediate_size % branches:
         raise ValueError(
             f"folded readout branches={branches} must divide "
             f"intermediate_size={intermediate_size}"
@@ -383,7 +427,16 @@ def resolve_folded_readout(config) -> tuple[int, int] | None:
             f"folded readout granularity={granularity} must divide the folded "
             f"width intermediate_size / branches = {folded_size}"
         )
-    return branches, granularity
+    sharing = resolve_ffn_sharing(config)
+    if sharing is not None and sharing[0] == "outer":
+        warnings.warn(
+            "fold_axis='channel' under pairing='outer' averages channels "
+            "that share one gate and differ only in the linear up channel; "
+            "this combination measurably costs acceptance length — "
+            "fold_axis='gate' is the lattice-aligned variant",
+            stacklevel=2,
+        )
+    return branches, granularity, "channel", None, None
 
 
 class FoldedSoftmaxReadout(nn.Module):
@@ -396,21 +449,54 @@ class FoldedSoftmaxReadout(nn.Module):
         intermediate_size: int,
         branches: int,
         granularity: int,
+        fold_axis: str = "channel",
+        gate_groups: int | None = None,
+        up_groups: int | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if branches < 1 or intermediate_size % branches:
+        if fold_axis not in ("channel", "gate"):
             raise ValueError(
-                f"folded readout branches={branches} must divide "
-                f"intermediate_size={intermediate_size}"
+                f"fold_axis must be 'channel' or 'gate', got {fold_axis!r}"
             )
-        folded_size = intermediate_size // branches
-        if granularity < 1 or folded_size % granularity:
-            raise ValueError(
-                f"folded readout granularity={granularity} must divide the "
-                f"folded width {folded_size}"
-            )
+        if fold_axis == "gate":
+            if not (isinstance(gate_groups, int) and isinstance(up_groups, int)):
+                raise ValueError(
+                    "fold_axis='gate' needs the outer lattice's gate_groups "
+                    "and up_groups"
+                )
+            if intermediate_size != gate_groups * up_groups:
+                raise ValueError(
+                    "gate-axis folding needs intermediate_size == "
+                    f"gate_groups * up_groups, got {intermediate_size} vs "
+                    f"{gate_groups} * {up_groups}"
+                )
+            if branches < 1 or gate_groups % branches:
+                raise ValueError(
+                    f"gate-axis branches={branches} must divide gate_groups="
+                    f"{gate_groups}"
+                )
+            folded_gate = gate_groups // branches
+            if granularity < 1 or folded_gate % granularity:
+                raise ValueError(
+                    f"gate-axis granularity={granularity} must divide the "
+                    f"folded gate width gate_groups / branches = "
+                    f"{folded_gate}"
+                )
+            folded_size = up_groups * folded_gate
+        else:
+            if branches < 1 or intermediate_size % branches:
+                raise ValueError(
+                    f"folded readout branches={branches} must divide "
+                    f"intermediate_size={intermediate_size}"
+                )
+            folded_size = intermediate_size // branches
+            if granularity < 1 or folded_size % granularity:
+                raise ValueError(
+                    f"folded readout granularity={granularity} must divide the "
+                    f"folded width {folded_size}"
+                )
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > 1:
             # The mixture needs every chunk of the gated hidden; with a
@@ -425,8 +511,15 @@ class FoldedSoftmaxReadout(nn.Module):
         self.intermediate_size = intermediate_size
         self.branches = branches
         self.granularity = granularity
+        self.fold_axis = fold_axis
+        self.gate_groups = gate_groups
+        self.up_groups = up_groups
         self.folded_size = folded_size
-        self.repeats = folded_size // granularity
+        self.repeats = (
+            (gate_groups // branches) // granularity
+            if fold_axis == "gate"
+            else folded_size // granularity
+        )
         self.proj = RowParallelLinear(
             folded_size,
             hidden_size,
@@ -438,12 +531,30 @@ class FoldedSoftmaxReadout(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         lead = hidden_states.shape[:-1]
-        chunks = hidden_states.reshape(
-            *lead, self.branches, self.repeats, self.granularity
-        )
         # Same dtype handling as the flare fusion weights: the logits are
         # loaded in the model dtype, so softmax runs there directly.
         weights = torch.softmax(self.fold_logits, dim=0)
+        if self.fold_axis == "gate":
+            # Lattice view (..., G_u, G_g) of the outer-ordered channels,
+            # then the same convex chunk mixture along the GATE axis: the
+            # pooled slots hold products that differ in gate (the nonlinear
+            # side), not the shared-up linear side.
+            chunks = hidden_states.reshape(
+                *lead,
+                self.up_groups,
+                self.branches,
+                self.repeats,
+                self.granularity,
+            )
+            mixed = (
+                chunks * weights.view(1, self.branches, 1, self.granularity)
+            ).sum(dim=-3)
+            mixed = mixed.reshape(*lead, self.folded_size)
+            output, _ = self.proj(mixed)
+            return output
+        chunks = hidden_states.reshape(
+            *lead, self.branches, self.repeats, self.granularity
+        )
         mixed = (
             chunks * weights.view(self.branches, 1, self.granularity)
         ).sum(dim=-3)
@@ -618,7 +729,7 @@ class SharedGLUMLP(nn.Module):
         pairing: str = "nested",
         gate_groups: int,
         up_groups: int,
-        folded_readout: tuple[int, int] | None = None,
+        folded_readout: tuple | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -655,12 +766,17 @@ class SharedGLUMLP(nn.Module):
                 prefix=f"{prefix}.down_proj",
             )
         else:
-            branches, granularity = folded_readout
+            branches, granularity, fold_axis, gate_groups, up_groups = (
+                folded_readout
+            )
             self.down_proj = FoldedSoftmaxReadout(
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 branches=branches,
                 granularity=granularity,
+                fold_axis=fold_axis,
+                gate_groups=gate_groups,
+                up_groups=up_groups,
                 quant_config=quant_config,
                 prefix=f"{prefix}.down_proj",
             )
@@ -744,7 +860,7 @@ class DominoQwen3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         else:
-            branches, granularity = folded_readout
+            branches, granularity = folded_readout[0], folded_readout[1]
             self.mlp = FoldedSoftmaxMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
