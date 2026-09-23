@@ -80,14 +80,14 @@ def test_resolve_folded_readout_defaults_match_training():
     # 35B-A3B draft: 9728 / 2560 = 3.8 -> 4 chunks of 2432, K = 16.
     assert resolve_folded_readout(
         _draft_config(dflash_config={"ffn_readout": "folded_softmax"})
-    ) == (4, 16, "channel", None, None)
+    ) == (4, 16, "channel", None, None, 1.0)
     assert resolve_folded_readout(
         _draft_config(
             dflash_config={
                 "ffn_readout": {"branches": 8, "granularity": 32}
             }
         )
-    ) == (8, 32, "channel", None, None)
+    ) == (8, 32, "channel", None, None, 1.0)
     # A 3N intermediate keeps the 3N -> N -> N shape of the design note.
     assert resolve_folded_readout(
         _draft_config(
@@ -95,7 +95,7 @@ def test_resolve_folded_readout_defaults_match_training():
             intermediate_size=12288,
             dflash_config={"ffn_readout": "folded_softmax"},
         )
-    ) == (3, 16, "channel", None, None)
+    ) == (3, 16, "channel", None, None, 1.0)
 
 
 def test_resolve_folded_readout_rejects_invalid_knobs():
@@ -197,7 +197,7 @@ def test_resolve_folded_readout_gate_axis():
     resolved = resolve_folded_readout(
         _draft_config(intermediate_size=48, dflash_config=lattice)
     )
-    assert resolved == (4, 3, "gate", 12, 4)
+    assert resolved == (4, 3, "gate", 12, 4, 1.0)
     # The gate axis only exists on the outer lattice.
     no_lattice = dict(lattice)
     no_lattice["ffn_sharing"] = {"pairing": "nested", "gate_groups": 12, "up_groups": 4}
@@ -238,7 +238,7 @@ def test_shared_glu_mlp_gate_fold_matches_the_training_formula(
         pairing="outer",
         gate_groups=12,
         up_groups=4,
-        folded_readout=(4, 3, "gate", 12, 4),
+        folded_readout=(4, 3, "gate", 12, 4, 1.0),
         prefix="layers.0.mlp",
     )
     assert mlp.down_proj.fold_axis == "gate"
