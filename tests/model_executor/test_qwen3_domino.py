@@ -10,12 +10,10 @@ import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.qwen3_domino import (
     DominoDraftAttention,
-    FoldedSoftmaxMLP,
-    FoldedSoftmaxReadout,
     Qwen3DominoModel,
+    RoutedOuterMLP,
     SharedGLUMLP,
     resolve_ffn_sharing,
-    resolve_folded_readout,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.platforms import current_platform
@@ -62,215 +60,6 @@ def test_domino_draft_attention_uses_full_attention_cache_spec():
     assert spec.head_size == sliding_spec.head_size
 
 
-def test_resolve_folded_readout_defaults_match_training():
-    # No knob (or an explicit dense mode) keeps today's Qwen3MLP.
-    assert resolve_folded_readout(_draft_config()) is None
-    assert (
-        resolve_folded_readout(
-            _draft_config(dflash_config={"ffn_readout": "dense"})
-        )
-        is None
-    )
-    assert (
-        resolve_folded_readout(
-            _draft_config(dflash_config={"ffn_readout": None})
-        )
-        is None
-    )
-    # 35B-A3B draft: 9728 / 2560 = 3.8 -> 4 chunks of 2432, K = 16.
-    assert resolve_folded_readout(
-        _draft_config(dflash_config={"ffn_readout": "folded_softmax"})
-    ) == (4, 16, "channel", None, None, 1.0)
-    assert resolve_folded_readout(
-        _draft_config(
-            dflash_config={
-                "ffn_readout": {"branches": 8, "granularity": 32}
-            }
-        )
-    ) == (8, 32, "channel", None, None, 1.0)
-    # A 3N intermediate keeps the 3N -> N -> N shape of the design note.
-    assert resolve_folded_readout(
-        _draft_config(
-            hidden_size=4096,
-            intermediate_size=12288,
-            dflash_config={"ffn_readout": "folded_softmax"},
-        )
-    ) == (3, 16, "channel", None, None, 1.0)
-
-
-def test_resolve_folded_readout_rejects_invalid_knobs():
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(dflash_config={"ffn_readout": "not_a_mode"})
-        )
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(dflash_config={"ffn_readout": {"branches": 5}})
-        )
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(
-                dflash_config={
-                    "ffn_readout": {"branches": 4, "granularity": 48}
-                }
-            )
-        )
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(dflash_config={"ffn_readout": ["folded_softmax"]})
-        )
-
-
-def test_folded_readout_mixture_matches_the_training_formula():
-    """The served mixture must be the chunk-wise softmax average it trained as."""
-
-    readout = object.__new__(FoldedSoftmaxReadout)
-    torch.nn.Module.__init__(readout)
-    readout.hidden_size = 4
-    readout.intermediate_size = 12
-    readout.branches = 3
-    readout.granularity = 2
-    readout.folded_size = 4
-    readout.repeats = 2
-    readout.fold_logits = torch.nn.Parameter(torch.randn(3, 2))
-    readout.proj = torch.nn.Linear(4, 4, bias=False)
-
-    hidden_states = torch.randn(5, 12)
-    out = readout(hidden_states)
-
-    weights = torch.softmax(readout.fold_logits.float(), dim=0)
-    chunks = hidden_states.reshape(5, 3, 2, 2)
-    mixed = (chunks * weights.view(3, 1, 2)).sum(dim=1).reshape(5, 4)
-    expected = torch.nn.functional.linear(mixed, readout.proj.weight)
-    assert torch.allclose(out, expected, atol=1e-6)
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("device", DEVICES)
-def test_folded_softmax_mlp_shapes_and_names(
-    default_vllm_config, dist_init, device
-) -> None:
-    if current_platform.is_cuda_alike():
-        torch.accelerator.set_device_index(device)
-    torch.set_default_device(device)
-
-    mlp = FoldedSoftmaxMLP(
-        hidden_size=8,
-        intermediate_size=24,
-        hidden_act="silu",
-        branches=3,
-        granularity=4,
-        prefix="layers.0.mlp",
-    )
-    parameters = dict(mlp.named_parameters())
-    assert parameters["gate_up_proj.weight"].shape == (48, 8)
-    # folded width = 24 / 3; the projection is an ordinary (quantizable) linear.
-    assert parameters["down_proj.proj.weight"].shape == (8, 8)
-    assert parameters["down_proj.fold_logits"].shape == (3, 4)
-    # Weight names stay aligned with the SpecForge export.
-    state_dict = mlp.state_dict()
-    assert "down_proj.proj.weight" in state_dict
-    assert "down_proj.fold_logits" in state_dict
-
-    hidden_states = torch.randn(4, 8)
-    gate_up, _ = mlp.gate_up_proj(hidden_states)
-    hidden = mlp.act_fn(gate_up)
-    # Uniform logits (the init) are the plain chunk average.
-    chunks = hidden.reshape(4, 3, 2, 4)
-    mixed = chunks.mean(dim=1).reshape(4, 8)
-    expected = torch.nn.functional.linear(
-        mixed, mlp.down_proj.proj.weight
-    )
-    assert torch.allclose(mlp(hidden_states), expected, atol=1e-2)
-
-
-def test_resolve_folded_readout_gate_axis():
-    lattice = {
-        "ffn_sharing": {"pairing": "outer", "gate_groups": 12, "up_groups": 4},
-        "ffn_readout": {
-            "mode": "folded_softmax",
-            "fold_axis": "gate",
-            "branches": 4,
-            "granularity": 3,
-        },
-    }
-    resolved = resolve_folded_readout(
-        _draft_config(intermediate_size=48, dflash_config=lattice)
-    )
-    assert resolved == (4, 3, "gate", 12, 4, 1.0)
-    # The gate axis only exists on the outer lattice.
-    no_lattice = dict(lattice)
-    no_lattice["ffn_sharing"] = {"pairing": "nested", "gate_groups": 12, "up_groups": 4}
-    with pytest.raises(ValueError):
-        resolve_folded_readout(_draft_config(intermediate_size=48, dflash_config=no_lattice))
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(intermediate_size=48, dflash_config={"ffn_readout": lattice["ffn_readout"]})
-        )
-    # Branches divide the gate axis, granularity the folded gate width.
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(intermediate_size=48, dflash_config={**lattice, "ffn_readout": {**lattice["ffn_readout"], "branches": 5}})
-        )
-    with pytest.raises(ValueError):
-        resolve_folded_readout(
-            _draft_config(intermediate_size=48, dflash_config={**lattice, "ffn_readout": {**lattice["ffn_readout"], "granularity": 2}})
-        )
-    # Lattice repetitions (m > 1) are rejected: I must equal G_g * G_u.
-    with pytest.raises(ValueError):
-        resolve_folded_readout(_draft_config(intermediate_size=96, dflash_config=lattice))
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("device", DEVICES)
-def test_shared_glu_mlp_gate_fold_matches_the_training_formula(
-    default_vllm_config, dist_init, device
-) -> None:
-    """The gate-axis fold pools products that differ in gate, not up."""
-    if current_platform.is_cuda_alike():
-        torch.accelerator.set_device_index(device)
-    torch.set_default_device(device)
-
-    mlp = SharedGLUMLP(
-        hidden_size=8,
-        intermediate_size=48,
-        hidden_act="silu",
-        pairing="outer",
-        gate_groups=12,
-        up_groups=4,
-        folded_readout=(4, 3, "gate", 12, 4, 1.0),
-        prefix="layers.0.mlp",
-    )
-    assert mlp.down_proj.fold_axis == "gate"
-    # 12 gates / 4 branches -> 3, x 4 ups = 12-wide readout, like the export.
-    assert mlp.down_proj.proj.weight.shape == (8, 12)
-    assert mlp.down_proj.fold_logits.shape == (4, 3)
-    state_dict = mlp.state_dict()
-    assert "down_proj.proj.weight" in state_dict
-    assert "down_proj.fold_logits" in state_dict
-
-    hidden_states = torch.randn(4, 8)
-    gate = torch.nn.functional.linear(
-        hidden_states, mlp.gate_up_proj.weight[:12]
-    )
-    up = torch.nn.functional.linear(hidden_states, mlp.gate_up_proj.weight[12:])
-    gated = torch.nn.functional.silu(gate[..., mlp.gate_idx]) * up[
-        ..., mlp.up_idx
-    ]
-    weights = torch.softmax(mlp.down_proj.fold_logits.float(), dim=0)
-    mixed = torch.zeros(4, 4, 3)
-    for c in range(4):
-        for rho in range(3):
-            for b in range(4):
-                mixed[:, c, rho] += weights[b, rho] * gated[
-                    :, c * 12 + b * 3 + rho
-                ]
-    expected = torch.nn.functional.linear(
-        mixed.reshape(4, 12), mlp.down_proj.proj.weight
-    )
-    assert torch.allclose(mlp(hidden_states), expected, atol=1e-5)
-
-
 def test_resolve_ffn_sharing_defaults_match_training():
     # No knob keeps today's Qwen3MLP; each side defaults to no sharing.
     assert resolve_ffn_sharing(_draft_config()) is None
@@ -279,7 +68,7 @@ def test_resolve_ffn_sharing_defaults_match_training():
     # Pure gate sharing k=2 on the 35B-A3B draft.
     assert resolve_ffn_sharing(
         _draft_config(dflash_config={"ffn_sharing": {"gate_groups": 4864}})
-    ) == ("nested", 4864, 9728)
+    ) == ("lattice", "nested", 4864, 9728)
     # The exactly-once outer lattice that keeps 9728 = 76 * 128.
     assert resolve_ffn_sharing(
         _draft_config(
@@ -287,7 +76,52 @@ def test_resolve_ffn_sharing_defaults_match_training():
                 "ffn_sharing": {"pairing": "outer", "gate_groups": 76, "up_groups": 128}
             }
         )
-    ) == ("outer", 76, 128)
+    ) == ("lattice", "outer", 76, 128)
+
+
+def test_resolve_ffn_sharing_routed_outer():
+    assert resolve_ffn_sharing(
+        _draft_config(
+            intermediate_size=48,
+            dflash_config={
+                "ffn_sharing": {
+                    "mode": "routed_outer",
+                    "experts": 4,
+                    "gate_groups": 3,
+                    "up_groups": 4,
+                }
+            },
+        )
+    ) == ("routed_outer", 4, 3, 4, "expert")
+    with pytest.raises(ValueError):  # wrong intermediate_size
+        resolve_ffn_sharing(
+            _draft_config(
+                intermediate_size=47,
+                dflash_config={
+                    "ffn_sharing": {
+                        "mode": "routed_outer",
+                        "experts": 4,
+                        "gate_groups": 3,
+                        "up_groups": 4,
+                    }
+                },
+            )
+        )
+    with pytest.raises(ValueError):  # gate_slot with a single expert
+        resolve_ffn_sharing(
+            _draft_config(
+                intermediate_size=12,
+                dflash_config={
+                    "ffn_sharing": {
+                        "mode": "routed_outer",
+                        "experts": 1,
+                        "gate_groups": 3,
+                        "up_groups": 4,
+                        "router": "gate_slot",
+                    }
+                },
+            )
+        )
 
 
 def test_resolve_ffn_sharing_rejects_invalid_knobs():
@@ -386,30 +220,6 @@ def test_shared_glu_mlp_matches_the_training_formula(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("device", DEVICES)
-def test_shared_glu_mlp_composes_with_the_folded_readout(
-    default_vllm_config, dist_init, device
-) -> None:
-    if current_platform.is_cuda_alike():
-        torch.accelerator.set_device_index(device)
-    torch.set_default_device(device)
-
-    mlp = SharedGLUMLP(
-        hidden_size=8,
-        intermediate_size=24,
-        hidden_act="silu",
-        gate_groups=12,
-        up_groups=24,
-        folded_readout=(3, 4),
-        prefix="layers.0.mlp",
-    )
-    assert isinstance(mlp.down_proj, FoldedSoftmaxReadout)
-    assert mlp.down_proj.proj.weight.shape == (8, 8)
-    assert mlp.down_proj.fold_logits.shape == (3, 4)
-    assert mlp(torch.randn(4, 8)).shape == (4, 8)
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("device", DEVICES)
 def test_shared_glu_mlp_loads_a_specforge_export(
     default_vllm_config, dist_init, device
 ) -> None:
@@ -448,6 +258,69 @@ def test_shared_glu_mlp_loads_a_specforge_export(
         ..., mlp.up_idx
     ]
     expected = torch.nn.functional.linear(expected_hidden, down_w)
+    assert torch.allclose(mlp(hidden_states), expected, atol=1e-5)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(
+    "experts,gate_groups,up_groups,router",
+    [(4, 3, 4, "expert"), (2, 3, 4, "gate_slot")],
+)
+def test_routed_outer_mlp_matches_the_training_formula(
+    default_vllm_config, dist_init, device, experts, gate_groups, up_groups, router
+) -> None:
+    """The served routed blend must be the math it trained as."""
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+
+    mlp = RoutedOuterMLP(
+        hidden_size=8,
+        intermediate_size=experts * gate_groups * up_groups,
+        hidden_act="silu",
+        experts=experts,
+        gate_groups=gate_groups,
+        up_groups=up_groups,
+        router=router,
+        prefix="layers.0.mlp",
+    )
+    total = experts * (gate_groups + up_groups)
+    assert mlp.gate_up_proj.weight.shape == (total + mlp.router_width, 8)
+    assert mlp.down_proj.weight.shape == (8, gate_groups * up_groups)
+    with torch.no_grad():
+        mlp.gate_up_proj.weight[total:].normal_()
+
+    hidden_states = torch.randn(4, 8)
+    fused = torch.nn.functional.linear(
+        hidden_states, mlp.gate_up_proj.weight
+    )
+    feats = fused[..., :total].reshape(4, experts, gate_groups + up_groups)
+    route = fused[..., total:]
+    ref = torch.zeros(4, gate_groups * up_groups)
+    if router == "expert":
+        alpha = torch.softmax(route, dim=-1)
+        for e in range(experts):
+            a = torch.nn.functional.silu(feats[:, e, :gate_groups]) * alpha[
+                :, e : e + 1
+            ]
+            u = feats[:, e, gate_groups:]
+            ref += (a.unsqueeze(-1) * u.unsqueeze(-2)).reshape(
+                4, gate_groups * up_groups
+            )
+    else:
+        delta = torch.softmax(
+            route.reshape(4, gate_groups, experts), dim=-1
+        )
+        for e in range(experts):
+            a = torch.nn.functional.silu(feats[:, e, :gate_groups]) * delta[
+                :, :, e
+            ]
+            u = feats[:, e, gate_groups:]
+            ref += (a.unsqueeze(-1) * u.unsqueeze(-2)).reshape(
+                4, gate_groups * up_groups
+            )
+    expected = torch.nn.functional.linear(ref, mlp.down_proj.weight)
     assert torch.allclose(mlp(hidden_states), expected, atol=1e-5)
 
 
