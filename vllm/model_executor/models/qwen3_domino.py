@@ -44,6 +44,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.multimodal.inputs import NestedTensors
@@ -750,6 +751,12 @@ class Qwen3DominoModel(nn.Module):
         self.target_hidden_size = dflash_config.get(
             "target_hidden_size", self.config.hidden_size
         )
+        # Mirrors SpecForge's dflash_config.out_proj_after_norm: the final
+        # norm runs at draft width and output_proj sits between it and the
+        # lm_head (folded away at load time when the head allows it).
+        self.out_proj_after_norm = bool(
+            dflash_config.get("out_proj_after_norm", False)
+        )
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.mask_token_id = dflash_config.get("mask_token_id")
 
@@ -810,7 +817,10 @@ class Qwen3DominoModel(nn.Module):
             self.target_hidden_size, eps=self.config.rms_norm_eps
         )
         self.norm = RMSNorm(
-            self.target_hidden_size, eps=self.config.rms_norm_eps
+            self.config.hidden_size
+            if self.out_proj_after_norm
+            else self.target_hidden_size,
+            eps=self.config.rms_norm_eps,
         )
 
         # Domino correction head.
@@ -826,7 +836,12 @@ class Qwen3DominoModel(nn.Module):
         use_embed_proj = dflash_config.get("use_embed_proj", True)
         if use_embed_proj:
             self.emb_dim = dflash_config["emb_dim"]
-            in_dim = self.target_hidden_size + self.gru_hidden_dim
+            z_dim = (
+                self.config.hidden_size
+                if self.out_proj_after_norm
+                else self.target_hidden_size
+            )
+            in_dim = z_dim + self.gru_hidden_dim
             self.embed_proj = nn.Sequential(
                 ReplicatedLinear(
                     in_dim,
@@ -859,7 +874,12 @@ class Qwen3DominoModel(nn.Module):
                     "use_hidden_proj=true requires hidden_proj_dim when "
                     "use_embed_proj=false"
                 )
-            in_dim = self.target_hidden_size + self.gru_hidden_dim
+            z_dim = (
+                self.config.hidden_size
+                if self.out_proj_after_norm
+                else self.target_hidden_size
+            )
+            in_dim = z_dim + self.gru_hidden_dim
             self.hidden_proj = nn.Sequential(
                 ReplicatedLinear(
                     in_dim,
@@ -921,6 +941,11 @@ class Qwen3DominoModel(nn.Module):
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states)
 
+        if self.out_proj_after_norm:
+            # output_proj moves to compute_draft_logits (or is folded into
+            # the lm_head at load); the correction head consumes this
+            # draft-width hidden directly.
+            return self.norm(hidden_states)
         if self.output_proj is not None:
             hidden_states = self.output_proj(hidden_states)
         return self.norm(hidden_states)
@@ -1293,6 +1318,10 @@ class Qwen3DominoForCausalLM(nn.Module):
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.model.out_proj_after_norm and self.model.output_proj is not None:
+            # Unfolded out_proj_after_norm fallback: output_proj survived load
+            # because the lm_head was not foldable.
+            hidden_states = self.model.output_proj(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1382,7 +1411,10 @@ class Qwen3DominoForCausalLM(nn.Module):
 
         if self.model.hidden_proj is not None:
             h = self.model.hidden_proj(features)
-            hidden_bias = self.logits_processor(self.lm_head, h)
+            # hidden_proj outputs target-width states; under a folded lm_head
+            # the unfolded head is kept around for exactly this path.
+            head = getattr(self, "_unfolded_lm_head", None) or self.lm_head
+            hidden_bias = self.logits_processor(head, h)
             bias = hidden_bias if bias is None else bias + hidden_bias
 
         assert bias is not None
@@ -1478,6 +1510,62 @@ class Qwen3DominoForCausalLM(nn.Module):
         self.model._build_fused_kv_buffers()
 
 
+def _fold_output_proj_into_lm_head(draft_model: nn.Module) -> bool:
+    """Fold ``output_proj`` into the installed lm_head: ``W_lm @ W_out``.
+
+    The lm_head is frozen, so per TP rank
+    ``weight[V_shard, H_target] @ output_proj[H_target, H_draft]`` is an exact
+    replacement for the two-GEMM sequence. On success the draft runs one
+    draft-width head GEMM per step and ``output_proj`` is dropped; the
+    unfolded head is kept for the hidden_proj correction path. Heads that are
+    not dense unquantized weights (e.g. a packed quantized target head) stay
+    unfolded: ``output_proj`` then runs inside ``compute_draft_logits``.
+    """
+    model = draft_model.model
+    if not model.out_proj_after_norm or model.output_proj is None:
+        return False
+    head = draft_model.lm_head
+    weight = getattr(head, "weight", None)
+    if (
+        head is None
+        or not isinstance(
+            getattr(head, "quant_method", None), UnquantizedEmbeddingMethod
+        )
+        or weight is None
+        or not weight.is_floating_point()
+    ):
+        logger.warning(
+            "out_proj_after_norm=true but the draft lm_head is not foldable "
+            "(missing or non-dense head); keeping the separate output_proj "
+            "GEMM in compute_draft_logits"
+        )
+        return False
+
+    out_w = model.output_proj.weight.data
+    fused = torch.matmul(weight.data, out_w).to(weight.dtype)
+    new_head = ParallelLMHead(
+        head.num_embeddings,
+        out_w.shape[1],
+        params_dtype=weight.dtype,
+        padding_size=head.padding_size,
+        prefix="lm_head",
+    )
+    assert new_head.weight.shape[0] == fused.shape[0], (
+        f"folded lm_head shard {tuple(fused.shape)} does not match a fresh "
+        f"head shard {tuple(new_head.weight.shape)}"
+    )
+    new_head.weight = nn.Parameter(fused, requires_grad=False)
+    if model.hidden_proj is not None:
+        draft_model._unfolded_lm_head = head
+    draft_model.lm_head = new_head
+    model.output_proj = None
+    logger.info(
+        "out_proj_after_norm: folded output_proj into lm_head "
+        f"{tuple(weight.shape)} @ {tuple(out_w.shape)} -> {tuple(fused.shape)}"
+    )
+    return True
+
+
 def load_domino_model(
     target_model: nn.Module,
     vllm_config: VllmConfig,
@@ -1552,5 +1640,8 @@ def load_domino_model(
         if draft_lm_head is not None:
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
+
+    if getattr(draft_model.model, "out_proj_after_norm", False):
+        _fold_output_proj_into_lm_head(draft_model)
 
     return draft_model

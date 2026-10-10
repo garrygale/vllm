@@ -356,6 +356,12 @@ class DFlashQwen3Model(nn.Module):
         drafter_config = getattr(self.config, "eagle_config", {})
         drafter_config.update(getattr(self.config, "dflash_config", {}))
 
+        if drafter_config.get("out_proj_after_norm", False):
+            raise NotImplementedError(
+                "out_proj_after_norm is only served for "
+                "dflash_config.projector_type='domino'"
+            )
+
         if drafter_config is not None and "use_aux_hidden_state" in drafter_config:
             self.use_aux_hidden_state = drafter_config["use_aux_hidden_state"]
         else:
