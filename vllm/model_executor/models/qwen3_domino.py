@@ -695,17 +695,25 @@ class DominoQwen3DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Residual-stream pattern (mirrors Qwen3DecoderLayer): passing the
+        # residual into each RMSNorm lets the platform fuse add+norm into
+        # one kernel (CUDA fused_add_rmsnorm / NPU npu_add_rms_norm).
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class Qwen3DominoModel(nn.Module):
@@ -938,14 +946,22 @@ class Qwen3DominoModel(nn.Module):
         if self.input_proj is not None:
             hidden_states = self.input_proj(hidden_states)
 
+        residual: torch.Tensor | None = None
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
+            hidden_states, residual = layer(
+                positions, hidden_states, residual
+            )
 
         if self.out_proj_after_norm:
             # output_proj moves to compute_draft_logits (or is folded into
             # the lm_head at load); the correction head consumes this
-            # draft-width hidden directly.
-            return self.norm(hidden_states)
+            # draft-width hidden directly, and the residual-arg norm fuses
+            # the final add into the last RMSNorm.
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states
+        # output_proj sits between the residual add and the final norm, so
+        # the add cannot fuse into the norm here.
+        hidden_states = hidden_states + residual
         if self.output_proj is not None:
             hidden_states = self.output_proj(hidden_states)
         return self.norm(hidden_states)
