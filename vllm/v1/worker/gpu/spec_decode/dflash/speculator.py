@@ -215,6 +215,52 @@ class DFlashSpeculator(DraftModelSpeculator):
                 }
 
     @torch.inference_mode()
+    def _prepare_attention_sinks(self, num_reqs: int) -> None:
+        """Extend draft seq_lens by the sinks and write the static sink K/V.
+
+        The sink row occupies the position exactly one past the draft block
+        (== the current seq_len before extension), reachable because domino
+        draft layers attend block-bidirectionally. Its slot is derived with
+        the same block-table clamp the prep kernel applies to query slots,
+        and is checked against this round's query slots: a clamp-induced
+        collision fails loudly instead of silently aliasing block row 0.
+        """
+        num_sinks = self.model.num_sinks
+        seq_lens = self.input_buffers.seq_lens[:num_reqs]
+        tail = seq_lens.to(torch.int64)
+
+        per_group = []
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            block_table = self.block_tables.input_block_tables[gid][:num_reqs]
+            stride = block_table.shape[1]
+            block_size = self.block_tables.kernel_block_sizes[gid]
+            block_num = torch.div(tail, block_size, rounding_mode="floor").clamp(
+                max=stride - 1
+            )
+            block_id = block_table.gather(
+                1, block_num.unsqueeze(1)
+            ).squeeze(1).to(torch.int64)
+            slots = block_id * block_size + tail % block_size
+
+            query_slots = self.block_tables.slot_mappings[gid][
+                : num_reqs * self.num_query_per_req
+            ].view(num_reqs, self.num_query_per_req).to(torch.int64)
+            if (query_slots == slots.unsqueeze(1)).any():
+                raise RuntimeError(
+                    "attention-sink tail slot collides with a draft query "
+                    "slot (block-table clamp saturated); the draft cache "
+                    "needs one extra position of allocation to host the sink"
+                )
+            per_group.append(slots)
+
+        seq_lens += num_sinks
+        if self._layer_group_idx is not None:
+            sink_slots = [per_group[gidx] for gidx in self._layer_group_idx]
+        else:
+            sink_slots = per_group[0]
+        self.model.write_attention_sinks(sink_slots)
+
+    @torch.inference_mode()
     def _run_model(
         self,
         num_tokens: int,
@@ -326,7 +372,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_query_per_req, self.max_model_len
+            max_seq_len
+            + self.num_query_per_req
+            + getattr(self.model, "num_sinks", 0),
+            self.max_model_len,
         )
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
@@ -397,6 +446,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+
+        # Attention sinks: extend the draft seq_lens by the sink rows and
+        # write the static sink K/V into the tail slot of each request. Runs
+        # eagerly with the context precompute (outside captured graphs).
+        if not dummy_run and getattr(self.model, "num_sinks", 0):
+            self._prepare_attention_sinks(num_reqs)
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables

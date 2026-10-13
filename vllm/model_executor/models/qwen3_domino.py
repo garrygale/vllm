@@ -180,6 +180,7 @@ class DominoQwen3Attention(nn.Module):
         attention_bias: bool = False,
         sliding_window: int | None = None,
         causal: bool = False,
+        num_sinks: int = 0,
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -271,6 +272,42 @@ class DominoQwen3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        # Learned attention sinks (dflash_config.attn_sink). Full-size over
+        # all KV heads; the TP shard is sliced at write time. Raw constants:
+        # no k_norm, no RoPE — written straight into the draft cache as one
+        # extra row one position past the draft block, which only block-
+        # bidirectional (non-causal) layers can see.
+        self.num_sinks = num_sinks
+        if self.num_sinks < 0:
+            raise ValueError(
+                f"dflash_config.attn_sink must be >= 0, got {self.num_sinks}"
+            )
+        if self.num_sinks:
+            if causal:
+                raise ValueError(
+                    "dflash_config.attn_sink requires non-causal draft layers "
+                    "in v1: the sink row sits one position past the draft "
+                    "block and is only reachable through block-bidirectional "
+                    "attention"
+                )
+            self.sink_k = nn.Parameter(
+                torch.zeros(
+                    self.num_sinks,
+                    self.total_num_kv_heads,
+                    self.head_dim,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.sink_v = nn.Parameter(
+                torch.zeros(
+                    self.num_sinks,
+                    self.total_num_kv_heads,
+                    self.head_dim,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
         # Domino draft blocks are non-causal: every query position sees the
         # whole context block and the current draft block.  Sliding-window
         # layers additionally restrict the context part of the mask to the
@@ -646,6 +683,7 @@ class DominoQwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             sliding_window=sliding_window,
             causal=causal,
+            num_sinks=int(_dflash_config(config).get("attn_sink", 0) or 0),
             cache_config=cache_config,
             quant_config=quant_config,
             rope_parameters=config.rope_parameters,
@@ -806,11 +844,21 @@ class Qwen3DominoModel(nn.Module):
                     target_hidden_size=self.target_hidden_size,
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
-                    prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                    prefix=maybe_prefix(
+                        prefix, f"layers.{layer_idx + start_layer_id}"
+                    ),
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
+        self.num_sinks = int(_dflash_config(self.config).get("attn_sink", 0) or 0)
+        if self.num_sinks:
+            layer_sinks = {layer.self_attn.num_sinks for layer in self.layers}
+            if layer_sinks != {self.num_sinks}:
+                raise ValueError(
+                    "all draft layers must share dflash_config.attn_sink; "
+                    f"model={self.num_sinks}, layers={sorted(layer_sinks)}"
+                )
 
         # Flare fusion: per-draft-layer softmax combination of target features.
         self.layer_fusion_weights = nn.Parameter(
@@ -1262,6 +1310,56 @@ class Qwen3DominoModel(nn.Module):
                 slot_mapping,
             )
 
+    @torch.inference_mode()
+    def write_attention_sinks(
+        self,
+        sink_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+    ) -> None:
+        """Write the static per-layer sink K/V rows into the draft caches.
+
+        ``sink_slot_mapping`` follows the context pass convention: one tensor
+        of slot ids per request (one sink row), either shared by all layers or
+        a per-layer list. ``None`` (or per-layer ``None`` entries) skips the
+        write, mirroring the dummy-run behavior of the context precompute.
+        Raw rows: no k_norm, no RoPE — the parameters are the cache content.
+        """
+        if not self.num_sinks or sink_slot_mapping is None:
+            return
+        per_layer = isinstance(sink_slot_mapping, (list, tuple))
+        tp_rank = get_tensor_model_parallel_rank()
+        for i, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            slot_mapping = (
+                sink_slot_mapping[i] if per_layer else sink_slot_mapping
+            )
+            if slot_mapping is None:
+                continue
+            num_reqs = slot_mapping.shape[0]
+            if attn.total_num_kv_heads > attn.num_kv_heads:
+                head0 = tp_rank * attn.num_kv_heads
+                heads = slice(head0, head0 + attn.num_kv_heads)
+            else:
+                heads = slice(None)
+            k = (
+                attn.sink_k[0:1, heads]
+                .to(dtype=attn.attn.kv_cache.dtype)
+                .expand(num_reqs, -1, -1)
+                .contiguous()
+            )
+            v = (
+                attn.sink_v[0:1, heads]
+                .to(dtype=attn.attn.kv_cache.dtype)
+                .expand(num_reqs, -1, -1)
+                .contiguous()
+            )
+            attn.attn.impl.do_kv_cache_update(
+                attn.attn,
+                k,
+                v,
+                attn.attn.kv_cache,
+                slot_mapping,
+            )
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".gate_proj": (".gate_up_proj", 0),
@@ -1272,8 +1370,6 @@ class Qwen3DominoModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-
 class Qwen3DominoForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -1324,6 +1420,10 @@ class Qwen3DominoForCausalLM(nn.Module):
     @property
     def pure_draft_prefix_len(self) -> int:
         return self.model.pure_draft_prefix_len
+
+    @property
+    def num_sinks(self) -> int:
+        return self.model.num_sinks
 
     def forward(
         self,

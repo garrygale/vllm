@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_domino import (
     DominoDraftAttention,
+    DominoQwen3Attention,
     Qwen3DominoForCausalLM,
     Qwen3DominoModel,
     RoutedOuterMLP,
@@ -42,6 +43,40 @@ def _draft_config(**overrides) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _make_domino_attention(**overrides) -> DominoQwen3Attention:
+    kwargs = dict(
+        hidden_size=64,
+        num_heads=4,
+        num_kv_heads=2,
+        target_hidden_size=64,
+        rope_parameters={"rope_type": "default"},
+        max_position=128,
+        head_dim=16,
+        sliding_window=None,
+        causal=False,
+        prefix="test.self_attn",
+    )
+    kwargs.update(overrides)
+    return DominoQwen3Attention(**kwargs)
+
+
+def test_domino_attention_sink_disabled_by_default():
+    attn = _make_domino_attention()
+    assert attn.num_sinks == 0
+    assert not hasattr(attn, "sink_k")
+
+
+def test_domino_attention_sink_params_and_causal_guard():
+    attn = _make_domino_attention(num_sinks=1)
+    assert attn.num_sinks == 1
+    assert attn.sink_k.shape == (1, 2, 16)
+    assert attn.sink_v.shape == (1, 2, 16)
+    assert torch.count_nonzero(attn.sink_k) == 0
+    assert torch.count_nonzero(attn.sink_v) == 0
+    with pytest.raises(ValueError, match="attn_sink"):
+        _make_domino_attention(num_sinks=1, causal=True)
 
 
 def test_domino_draft_attention_uses_full_attention_cache_spec():

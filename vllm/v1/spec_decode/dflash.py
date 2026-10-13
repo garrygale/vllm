@@ -36,6 +36,19 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
 
+        draft_hf_config = vllm_config.speculative_config.draft_model_config.hf_config
+        if int(
+            (getattr(draft_hf_config, "dflash_config", None) or {}).get(
+                "attn_sink", 0
+            )
+            or 0
+        ):
+            raise NotImplementedError(
+                "dflash_config.attn_sink is served through the v2 domino "
+                "speculator (worker/gpu/spec_decode); the v1 proposer path "
+                "does not implement the sink row yet"
+            )
+
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         # Positions covers both context states + query states
