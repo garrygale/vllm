@@ -1425,6 +1425,9 @@ class Qwen3DominoForCausalLM(nn.Module):
     def num_sinks(self) -> int:
         return self.model.num_sinks
 
+    def write_attention_sinks(self, sink_slot_mapping) -> None:
+        self.model.write_attention_sinks(sink_slot_mapping)
+
     def forward(
         self,
         input_ids: torch.Tensor,
