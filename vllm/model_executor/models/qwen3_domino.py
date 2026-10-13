@@ -1340,15 +1340,23 @@ class Qwen3DominoModel(nn.Module):
                 heads = slice(head0, head0 + attn.num_kv_heads)
             else:
                 heads = slice(None)
+            # kv_cache may be a plain tensor or a runner-owned tuple; take
+            # the first tensor's dtype so the sink rows match the cache.
+            kv_cache = attn.attn.kv_cache
+            cache_dtype = (
+                kv_cache.dtype
+                if torch.is_tensor(kv_cache)
+                else next(t.dtype for t in kv_cache if torch.is_tensor(t))
+            )
             k = (
                 attn.sink_k[0:1, heads]
-                .to(dtype=attn.attn.kv_cache.dtype)
+                .to(dtype=cache_dtype)
                 .expand(num_reqs, -1, -1)
                 .contiguous()
             )
             v = (
                 attn.sink_v[0:1, heads]
-                .to(dtype=attn.attn.kv_cache.dtype)
+                .to(dtype=cache_dtype)
                 .expand(num_reqs, -1, -1)
                 .contiguous()
             )
@@ -1356,7 +1364,7 @@ class Qwen3DominoModel(nn.Module):
                 attn.attn,
                 k,
                 v,
-                attn.attn.kv_cache,
+                kv_cache,
                 slot_mapping,
             )
 
