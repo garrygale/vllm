@@ -655,6 +655,114 @@ class RoutedOuterMLP(nn.Module):
         return self.combine(fused)
 
 
+class DominoGroupedConv(nn.Module):
+    """Serving port of SpecForge's DFlashGroupedConv.
+
+    Parameter names (``base_kernel``, ``kernel_projection``) match the
+    training export, and identity-init makes the module an exact no-op
+    before training moves the weights. ``_convolve`` accepts any leading
+    batch dims: training feeds [B, blocks*block, H], serving feeds the
+    flattened [num_reqs*block, H] token stream.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        block_size: int,
+        taps: int,
+        group_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        if taps < 1 or taps > block_size:
+            raise ValueError(
+                f"conv_kernel_size must be in [1, block_size={block_size}], "
+                f"got {taps}"
+            )
+        if group_size < 1 or hidden_size % group_size:
+            raise ValueError(
+                f"conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}"
+            )
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.num_groups = int(hidden_size) // int(group_size)
+
+        base_kernel = torch.zeros(
+            2, self.taps, int(hidden_size), dtype=dtype
+        )
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(base_kernel)
+        self.kernel_projection = ReplicatedLinear(
+            int(hidden_size),
+            2 * self.taps * self.num_groups,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=None,
+            prefix="conv.kernel_projection",
+        )
+
+    def _convolve(
+        self,
+        hidden_states: torch.Tensor,
+        delta: torch.Tensor,
+        *,
+        side: int,
+    ) -> torch.Tensor:
+        seq_len = hidden_states.shape[-2]
+        hidden_size = hidden_states.shape[-1]
+        if seq_len % self.block_size:
+            raise ValueError(
+                f"conv sequence length {seq_len} not divisible by "
+                f"block_size={self.block_size}"
+            )
+        shape = hidden_states.shape
+        blocks = hidden_states.reshape(
+            -1,
+            seq_len // self.block_size,
+            self.block_size,
+            self.num_groups,
+            hidden_size // self.num_groups,
+        )
+        dynamic = delta.reshape(
+            -1,
+            seq_len // self.block_size,
+            self.block_size,
+            self.taps,
+            self.num_groups,
+        )
+        base = self.base_kernel[side].reshape(
+            1, 1, 1, self.taps, self.num_groups, -1
+        )
+        coefficients = base + dynamic.unsqueeze(-1)
+
+        output = coefficients[:, :, :, 0] * blocks
+        for tap in range(1, self.taps):
+            shifted = F.pad(
+                blocks[:, :, : self.block_size - tap],
+                (0, 0, 0, 0, tap, 0),
+            )
+            output = output + coefficients[:, :, :, tap] * shifted
+        return output.reshape(shape)
+
+    def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        delta = self.kernel_projection(hidden_states)[0]
+        delta = delta.reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, delta[..., 0, :, :], side=0),
+            delta[..., 1, :, :],
+        )
+
+    def finish(
+        self,
+        hidden_states: torch.Tensor,
+        coefficients: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DominoQwen3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -690,6 +798,49 @@ class DominoQwen3DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         _reject_retired_fold(config)
+        conv_cfg = _dflash_config(config)
+        conv_taps = conv_cfg.get("conv_kernel_size")
+        conv_group = conv_cfg.get("conv_group_size")
+        if conv_taps is None and conv_group is None:
+            self.attention_conv: DominoGroupedConv | None = None
+            self.mlp_conv: DominoGroupedConv | None = None
+        else:
+            if (
+                not isinstance(conv_taps, int)
+                or isinstance(conv_taps, bool)
+                or not isinstance(conv_group, int)
+                or isinstance(conv_group, bool)
+            ):
+                raise ValueError(
+                    "domino conv requires integer dflash_config."
+                    "conv_kernel_size and conv_group_size"
+                )
+            # Canonical entry: top-level config.block_size (what every draft
+            # config carries and SpecForge reads first); dflash_config.
+            # block_size is a legacy fallback kept for old exports only.
+            block_size = int(
+                getattr(config, "block_size", None)
+                or conv_cfg.get("block_size", 0)
+                or 0
+            )
+            if block_size <= 0:
+                raise ValueError(
+                    "domino conv requires dflash_config.block_size in the "
+                    "draft config"
+                )
+            dtype = vllm_config.model_config.dtype
+
+            def grouped_conv() -> DominoGroupedConv:
+                return DominoGroupedConv(
+                    hidden_size=int(config.hidden_size),
+                    block_size=block_size,
+                    taps=conv_taps,
+                    group_size=conv_group,
+                    dtype=dtype,
+                )
+
+            self.attention_conv = grouped_conv()
+            self.mlp_conv = grouped_conv()
         sharing = resolve_ffn_sharing(config)
         if sharing is None:
             self.mlp = Qwen3MLP(
@@ -745,12 +896,24 @@ class DominoQwen3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual
             )
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(
+                hidden_states
+            )
         hidden_states = self.self_attn(positions, hidden_states)
+        if self.attention_conv is not None:
+            hidden_states = self.attention_conv.finish(
+                hidden_states, attention_kernel
+            )
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.mlp_conv is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 

@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_domino import (
     DominoDraftAttention,
+    DominoGroupedConv,
     DominoQwen3Attention,
     Qwen3DominoForCausalLM,
     Qwen3DominoModel,
@@ -60,6 +61,64 @@ def _make_domino_attention(**overrides) -> DominoQwen3Attention:
     )
     kwargs.update(overrides)
     return DominoQwen3Attention(**kwargs)
+
+
+def _make_grouped_conv(taps=2, group_size=8, hidden=32, block=4):
+    return DominoGroupedConv(
+        hidden_size=hidden,
+        block_size=block,
+        taps=taps,
+        group_size=group_size,
+        dtype=torch.float32,
+    )
+
+
+def test_grouped_conv_fresh_init_is_exact_identity():
+    conv = _make_grouped_conv(taps=3)
+    x = torch.randn(2, 12, 32)
+    prepared, coeff = conv.prepare(x)
+    assert torch.equal(prepared, x)
+    assert torch.equal(conv.finish(x, coeff), x)
+
+
+def test_grouped_conv_flattened_matches_batched():
+    """Serving feeds [T, H]; training feeds [B, blocks*block, H]."""
+
+    torch.manual_seed(0)
+    conv = _make_grouped_conv()
+    with torch.no_grad():
+        conv.base_kernel.normal_(0, 0.2)
+        conv.kernel_projection.weight.normal_(0, 0.2)
+    x = torch.randn(2, 12, 32)
+    batched, coeff = conv.prepare(x)
+    batched = conv.finish(batched, coeff)
+    flat_in = x.reshape(24, 32)
+    flat, coeff_flat = conv.prepare(flat_in)
+    flat = conv.finish(flat, coeff_flat)
+    assert torch.allclose(
+        batched.reshape(24, 32), flat, atol=1e-5, rtol=1e-5
+    )
+
+
+def test_grouped_conv_causality_within_block():
+    """Later taps must not see future positions inside the block."""
+
+    conv = _make_grouped_conv(taps=2)
+    with torch.no_grad():
+        conv.base_kernel.zero_()
+        conv.base_kernel[0, 1] = 1.0  # output = previous position only
+        conv.kernel_projection.weight.zero_()
+    x = torch.randn(1, 8, 32)
+    out, _ = conv.prepare(x)
+    assert torch.allclose(out[0, 1:8], x[0, 0:7])
+    assert torch.allclose(out[0, 0], torch.zeros_like(out[0, 0]))
+
+
+def test_grouped_conv_rejects_bad_geometry():
+    with pytest.raises(ValueError):
+        _make_grouped_conv(taps=0)
+    with pytest.raises(ValueError):
+        _make_grouped_conv(group_size=7)
 
 
 def test_domino_attention_sink_disabled_by_default():
