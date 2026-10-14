@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -558,3 +559,147 @@ def test_compute_draft_logits_projects_unfolded_hidden(
     torch.testing.assert_close(
         draft.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
     )
+
+
+def _reference_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """transformers/vLLM RMSNorm math, written out by hand."""
+    variance = x.pow(2).mean(-1, keepdim=True)
+    return weight * (x * torch.rsqrt(variance + eps))
+
+
+def _tap_norm_model(
+    *,
+    tap_norm: bool,
+    num_target_features: int = 3,
+    target_hidden_size: int = 8,
+    num_layers: int = 2,
+) -> SimpleNamespace:
+    """The subset of Qwen3DominoModel that ``combine_hidden_states`` touches."""
+    torch.manual_seed(0)
+    norms = None
+    if tap_norm:
+        norms = torch.nn.ModuleList(
+            [
+                RMSNorm(target_hidden_size, eps=1e-6)
+                for _ in range(num_target_features)
+            ]
+        )
+        with torch.no_grad():
+            for index, norm in enumerate(norms):
+                # Distinct gains so a tap-index swap cannot pass.
+                norm.weight.fill_(0.5 + index)
+    model = SimpleNamespace(
+        num_target_features=num_target_features,
+        target_hidden_size=target_hidden_size,
+        aux_hidden_norms=norms,
+        layer_fusion_weights=torch.randn(num_layers, num_target_features),
+        config=SimpleNamespace(num_hidden_layers=num_layers),
+    )
+    return SimpleNamespace(model=model)
+
+
+def _reference_flare_fusion(
+    holder: SimpleNamespace, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    model = holder.model
+    taps = hidden_states.view(
+        -1, model.num_target_features, model.target_hidden_size
+    )
+    if model.aux_hidden_norms is not None:
+        taps = torch.stack(
+            [
+                _reference_rms_norm(taps[:, index, :], norm.weight)
+                for index, norm in enumerate(model.aux_hidden_norms)
+            ],
+            dim=1,
+        )
+    fusion = torch.softmax(model.layer_fusion_weights, dim=1)
+    return torch.matmul(fusion, taps).reshape(
+        -1, model.config.num_hidden_layers * model.target_hidden_size
+    )
+
+
+@torch.inference_mode()
+def test_target_tap_norm_normalizes_each_tap_before_the_fusion() -> None:
+    """dflash_config.target_tap_norm must run per tap, before the softmax mix."""
+    holder = _tap_norm_model(tap_norm=True)
+    hidden = torch.randn(4, 3 * 8)
+    expected = _reference_flare_fusion(holder, hidden)
+    actual = Qwen3DominoForCausalLM.combine_hidden_states(holder, hidden)
+    assert actual.shape == (4, 2 * 8)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    # A single row takes the squeeze path but the same normalization.
+    single = hidden[0]
+    torch.testing.assert_close(
+        Qwen3DominoForCausalLM.combine_hidden_states(holder, single),
+        _reference_flare_fusion(holder, single.unsqueeze(0)).squeeze(0),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+@torch.inference_mode()
+def test_without_the_flag_the_raw_concat_is_fused() -> None:
+    """The default path is bit-identical to the unrestricted flare fusion."""
+    holder = _tap_norm_model(tap_norm=False)
+    hidden = torch.randn(4, 3 * 8)
+    taps = hidden.view(4, 3, 8)
+    fusion = torch.softmax(holder.model.layer_fusion_weights, dim=1)
+    expected = torch.matmul(fusion, taps).reshape(4, 2 * 8)
+    actual = Qwen3DominoForCausalLM.combine_hidden_states(holder, hidden)
+    assert torch.equal(actual, expected)
+
+
+class _TargetTapNormKeyHolder(torch.nn.Module):
+    """Replicates the served draft key path (params under ``model.``)."""
+
+    def __init__(self, *, tap_norm: bool) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.fc = torch.nn.Linear(24, 8, bias=False)
+        self.model.aux_hidden_norms = (
+            torch.nn.ModuleList([RMSNorm(8, eps=1e-6) for _ in range(3)])
+            if tap_norm
+            else None
+        )
+
+    def load_weights(self, weights):
+        mapped = []
+        for name, weight in weights:
+            if name.startswith("model."):
+                name = name[len("model.") :]
+            if "lm_head" not in name:
+                name = "model." + name
+            mapped.append((name, weight))
+        return AutoWeightsLoader(self).load_weights(mapped)
+
+
+def test_target_tap_norm_checkpoint_keys_load_under_the_model_prefix() -> None:
+    holder = _TargetTapNormKeyHolder(tap_norm=True)
+    weights = [
+        (f"aux_hidden_norms.{index}.weight", torch.full((8,), 1.0 + index))
+        for index in range(3)
+    ]
+    weights.append(("fc.weight", torch.zeros(8, 24)))
+    loaded = holder.load_weights(weights)
+    assert {f"model.aux_hidden_norms.{index}.weight" for index in range(3)} <= loaded
+    for index in range(3):
+        assert torch.equal(
+            holder.model.aux_hidden_norms[index].weight,
+            torch.full((8,), 1.0 + index),
+        )
+
+
+def test_target_tap_norm_keys_fail_loudly_without_the_flag() -> None:
+    """A flag-off model must not silently drop trained normalization."""
+    holder = _TargetTapNormKeyHolder(tap_norm=False)
+    with pytest.raises(ValueError, match="aux_hidden_norms"):
+        holder.load_weights(
+            [
+                ("aux_hidden_norms.0.weight", torch.ones(8)),
+                ("fc.weight", torch.zeros(8, 24)),
+            ]
+        )

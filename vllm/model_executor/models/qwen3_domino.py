@@ -1042,6 +1042,26 @@ class Qwen3DominoModel(nn.Module):
             eps=self.config.rms_norm_eps,
         )
 
+        # Per-tap RMSNorm on the captured target features before the fusion
+        # (dflash_config.target_tap_norm).  The taps of the concatenated feature
+        # differ by up to ~50x in RMS on a real target, so one shared per-token
+        # activation scale starves the quiet taps -- the ones the trained fusion
+        # reads most.  The parameter layout matches the Laguna drafts served by
+        # ``laguna_dflash.py``, so a checkpoint trained with the same flag loads
+        # unchanged and vice versa.
+        self.target_tap_norm = bool(dflash_config.get("target_tap_norm", False))
+        if self.target_tap_norm:
+            self.aux_hidden_norms = nn.ModuleList(
+                [
+                    RMSNorm(
+                        self.target_hidden_size, eps=self.config.rms_norm_eps
+                    )
+                    for _ in range(self.num_target_features)
+                ]
+            )
+        else:
+            self.aux_hidden_norms = None
+
         # Domino correction head.
         self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
         self.prefix_gru = nn.GRU(
@@ -1661,6 +1681,13 @@ class Qwen3DominoForCausalLM(nn.Module):
             self.model.num_target_features,
             self.model.target_hidden_size,
         )
+        # Mirror the trained per-tap RMSNorm before the fusion: the served
+        # Laguna drafts slice, normalize and re-concatenate in the same order.
+        if self.model.aux_hidden_norms is not None:
+            normed = torch.empty_like(target)
+            for index, norm in enumerate(self.model.aux_hidden_norms):
+                normed[:, index, :] = norm(target[:, index, :])
+            target = normed
         fusion_w = torch.softmax(self.model.layer_fusion_weights, dim=1)
         # [D, T] @ [N, T, H] -> [N, D, H] (broadcast matmul, no
         # materialization of [N, D, T, H]).  Plain matmul instead of einsum:

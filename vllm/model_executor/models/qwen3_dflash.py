@@ -367,6 +367,16 @@ class DFlashQwen3Model(nn.Module):
         else:
             self.use_aux_hidden_state = True
 
+        # Per-tap RMSNorm on the captured target features before ``fc``
+        # (dflash_config.target_tap_norm).  The taps of the concatenated feature
+        # differ by up to ~50x in RMS on a real target, so one shared per-token
+        # activation scale starves the quiet taps -- the ones the trained ``fc``
+        # reads most.  The parameter layout matches the Laguna drafts served by
+        # ``laguna_dflash.py``, so a checkpoint trained with the same flag loads
+        # unchanged and vice versa.
+        self.target_tap_norm = bool(drafter_config.get("target_tap_norm", False))
+        self.aux_hidden_norms = None
+
         current_vllm_config = get_current_vllm_config()
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -419,6 +429,16 @@ class DFlashQwen3Model(nn.Module):
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
             )
+            if self.target_tap_norm:
+                self.aux_hidden_norms = nn.ModuleList(
+                    [
+                        RMSNorm(
+                            fc_input_size // num_features_to_use,
+                            eps=self.config.rms_norm_eps,
+                        )
+                        for _ in range(num_features_to_use)
+                    ]
+                )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -763,6 +783,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
+        # Mirror the trained per-tap RMSNorm before ``fc``: the served Laguna
+        # drafts slice, normalize and re-concatenate in the same order.  The
+        # quantized ``fc`` therefore sees normalized taps.
+        if self.model.aux_hidden_norms is not None:
+            num_slices = len(self.model.aux_hidden_norms)
+            slice_size = expected // num_slices
+            taps = hidden_states.reshape(-1, num_slices, slice_size)
+            normed = torch.empty_like(taps)
+            for index, norm in enumerate(self.model.aux_hidden_norms):
+                normed[:, index, :] = norm(taps[:, index, :])
+            hidden_states = normed.reshape(hidden_states.shape[0], -1)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
