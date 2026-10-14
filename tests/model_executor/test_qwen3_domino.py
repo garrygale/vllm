@@ -73,8 +73,12 @@ def _make_grouped_conv(taps=2, group_size=8, hidden=32, block=4):
     )
 
 
-def test_grouped_conv_fresh_init_is_exact_identity():
+def test_grouped_conv_identity_base_is_a_noop():
+    """base_kernel identity + zero dynamic delta -> prepare/finish change nothing."""
+
     conv = _make_grouped_conv(taps=3)
+    with torch.no_grad():
+        conv.kernel_projection.weight.zero_()
     x = torch.randn(2, 12, 32)
     prepared, coeff = conv.prepare(x)
     assert torch.equal(prepared, x)
@@ -101,7 +105,7 @@ def test_grouped_conv_flattened_matches_batched():
 
 
 def test_grouped_conv_causality_within_block():
-    """Later taps must not see future positions inside the block."""
+    """Later taps must not see future positions, or cross block boundaries."""
 
     conv = _make_grouped_conv(taps=2)
     with torch.no_grad():
@@ -110,8 +114,11 @@ def test_grouped_conv_causality_within_block():
         conv.kernel_projection.weight.zero_()
     x = torch.randn(1, 8, 32)
     out, _ = conv.prepare(x)
-    assert torch.allclose(out[0, 1:8], x[0, 0:7])
+    # 8 tokens is two 4-token blocks; each block starts with no predecessor.
     assert torch.allclose(out[0, 0], torch.zeros_like(out[0, 0]))
+    assert torch.allclose(out[0, 1:4], x[0, 0:3])
+    assert torch.allclose(out[0, 4], torch.zeros_like(out[0, 4]))
+    assert torch.allclose(out[0, 5:8], x[0, 4:7])
 
 
 def test_grouped_conv_rejects_bad_geometry():

@@ -659,10 +659,10 @@ class DominoGroupedConv(nn.Module):
     """Serving port of SpecForge's DFlashGroupedConv.
 
     Parameter names (``base_kernel``, ``kernel_projection``) match the
-    training export, and identity-init makes the module an exact no-op
-    before training moves the weights. ``_convolve`` accepts any leading
-    batch dims: training feeds [B, blocks*block, H], serving feeds the
-    flattened [num_reqs*block, H] token stream.
+    training export and are always supplied by the checkpoint.
+    ``_convolve`` accepts any leading batch dims: training feeds
+    [B, blocks*block, H], serving feeds the flattened [num_reqs*block, H]
+    token stream.
     """
 
     def __init__(
