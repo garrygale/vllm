@@ -21,6 +21,8 @@ from vllm.model_executor.models.qwen3_domino import (
     RoutedOuterMLP,
     SharedGLUMLP,
     _fold_output_proj_into_lm_head,
+    _resolve_vha_load_spec,
+    fold_vha_weights,
     resolve_ffn_sharing,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -127,6 +129,90 @@ def test_grouped_conv_rejects_bad_geometry():
         _make_grouped_conv(taps=0)
     with pytest.raises(ValueError):
         _make_grouped_conv(group_size=7)
+
+
+def _vha_weight_dict(nh=4, nkv=2, hd=8, hidden=32, seed=0):
+    torch.manual_seed(seed)
+    physical = nh // nkv
+    q = torch.randn(physical * hd, hidden)
+    o = torch.randn(hidden, nh * hd)
+    premix = torch.randn(nkv, hd, hd)
+    u = torch.randn(nh, 2)
+    v = torch.randn(nh, 2)
+    weights = {
+        "model.layers.0.self_attn.q_proj.weight": q,
+        "model.layers.0.self_attn.o_proj.weight": o,
+        "model.layers.0.self_attn.vha_premix": premix,
+        "model.layers.0.self_attn.vha_postmix_u": u,
+        "model.layers.0.self_attn.vha_postmix_v": v,
+    }
+    return weights, q, o, premix, u, v
+
+
+def test_vha_weights_fold_in_place():
+    weights, q, o, premix, u, v = _vha_weight_dict()
+    nh, nkv, hd = 4, 2, 8
+    physical = nh // nkv
+
+    assert fold_vha_weights(weights, nh, hd)
+    assert not any("vha" in name for name in weights)
+
+    folded_q = weights["model.layers.0.self_attn.q_proj.weight"]
+    assert folded_q.shape == (nh * hd, q.shape[1])
+    ref_q = torch.zeros_like(folded_q)
+    for k in range(nkv):
+        for i in range(physical):
+            ref_q[(k * physical + i) * hd : (k * physical + i + 1) * hd] = (
+                premix[k].t() @ q[i * hd : (i + 1) * hd]
+            )
+    assert torch.allclose(folded_q, ref_q, atol=1e-5)
+
+    folded_o = weights["model.layers.0.self_attn.o_proj.weight"]
+    assert folded_o.shape == o.shape
+    ref_o = o.clone().view(o.shape[0], nh, hd)
+    for w in range(nh):
+        for r in range(u.shape[1]):
+            c = sum(v[vv, r] * o.view(o.shape[0], nh, hd)[:, vv, :] for vv in range(nh))
+            ref_o[:, w, :] += u[w, r] * c
+    assert torch.allclose(folded_o, ref_o.reshape(o.shape), atol=1e-4)
+
+
+def test_fold_vha_weights_rejects_incomplete_params():
+    weights, *_ = _vha_weight_dict()
+    del weights["model.layers.0.self_attn.vha_postmix_v"]
+    with pytest.raises(ValueError, match="incomplete VHA"):
+        fold_vha_weights(weights, 4, 8)
+
+
+def test_fold_vha_weights_rejects_width_mismatch():
+    weights, *_ = _vha_weight_dict()
+    weights["model.layers.0.self_attn.q_proj.weight"] = torch.randn(64, 32)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        fold_vha_weights(weights, 4, 8)
+
+
+def test_fold_vha_weights_passes_through_plain_checkpoint():
+    weights = {"model.layers.0.self_attn.q_proj.weight": torch.randn(32, 8)}
+    assert not fold_vha_weights(weights, 4, 8)
+
+
+def test_resolve_vha_load_spec():
+    assert _resolve_vha_load_spec(SimpleNamespace(dflash_config={})) is None
+    cfg = SimpleNamespace(
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        dflash_config={"vha": {"physical_q_heads": 2}},
+    )
+    assert _resolve_vha_load_spec(cfg) == 2
+    with pytest.raises(ValueError, match="physical_q_heads"):
+        _resolve_vha_load_spec(SimpleNamespace(dflash_config={"vha": {}}))
+    bad = SimpleNamespace(
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        dflash_config={"vha": {"physical_q_heads": 3}},
+    )
+    with pytest.raises(ValueError, match="num_attention_heads"):
+        _resolve_vha_load_spec(bad)
 
 
 def test_domino_attention_sink_disabled_by_default():

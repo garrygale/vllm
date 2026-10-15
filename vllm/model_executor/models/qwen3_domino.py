@@ -17,6 +17,7 @@ uses per-draft-layer softmax fusion of the target hidden states
 """
 
 from collections.abc import Iterable
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -387,6 +388,124 @@ def _reject_retired_fold(config) -> None:
         "inert). Drop the key, or serve old checkpoints from the "
         "outer_ffn_fold tag."
     )
+
+
+def _resolve_vha_load_spec(config) -> Optional[int]:
+    """``physical_q_heads`` from ``dflash_config.vha``; None for plain GQA.
+
+    Serving counterpart of SpecForge's training-side resolver: a VHA
+    checkpoint keeps its training parameterization (physical-width q_proj
+    plus ``vha_premix``/``vha_postmix_*``) and the loader folds it back
+    into standard GQA at weight-load time.  QAT-exported int-packed
+    checkpoints cannot be folded here and must go through
+    ``scripts/fold_vha.py`` before quantization instead.
+    """
+
+    raw = (getattr(config, "dflash_config", None) or {}).get("vha")
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, dict) or "physical_q_heads" not in raw:
+        raise ValueError(
+            "dflash_config.vha must be a dict with physical_q_heads, got "
+            f"{raw!r}"
+        )
+    physical = raw["physical_q_heads"]
+    num_heads = int(getattr(config, "num_attention_heads", 0))
+    num_kv = int(getattr(config, "num_key_value_heads", 0))
+    if (
+        not isinstance(physical, int)
+        or isinstance(physical, bool)
+        or num_heads != physical * num_kv
+    ):
+        raise ValueError(
+            "dflash_config.vha needs num_attention_heads == physical_q_heads "
+            f"* num_key_value_heads, got {num_heads} vs {physical} * {num_kv}"
+        )
+    return physical
+
+
+_VHA_PARAMS = ("vha_premix", "vha_postmix_u", "vha_postmix_v")
+
+
+def fold_vha_weights(
+    model_weights: dict, num_heads: int, head_dim: int
+) -> bool:
+    """Fold VHA premix/postmix into q_proj/o_proj entries, in place.
+
+    Serving mirror of SpecForge ``specforge/modeling/draft/vha.py`` (keep
+    the einsum-free formulations in sync).  Returns whether any VHA
+    parameters were found; raises on incomplete or shape-mismatched sets.
+    """
+
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    for name in list(model_weights):
+        for param in _VHA_PARAMS:
+            if name.endswith("." + param):
+                pending.setdefault(name[: -(len(param) + 1)], {})[
+                    param
+                ] = model_weights.pop(name)
+    if not pending:
+        return False
+
+    for prefix, params in pending.items():
+        missing = set(_VHA_PARAMS) - set(params)
+        if missing:
+            raise ValueError(
+                f"incomplete VHA parameters under {prefix!r}: missing {sorted(missing)}"
+            )
+        premix, u, v = (
+            params["vha_premix"],
+            params["vha_postmix_u"],
+            params["vha_postmix_v"],
+        )
+
+        q_key = f"{prefix}.q_proj.weight"
+        q_weight = model_weights[q_key]
+        if not q_weight.is_floating_point():
+            raise ValueError(
+                f"VHA parameters at {prefix!r} arrive with non-float q_proj "
+                "weights: int-packed QAT exports cannot be folded at load. "
+                "Run SpecForge scripts/fold_vha.py before the QAT stage."
+            )
+        num_kv = premix.shape[0]
+        physical = q_weight.shape[0] // head_dim
+        if (
+            q_weight.shape[0] != physical * head_dim
+            or num_heads != physical * num_kv
+        ):
+            raise ValueError(
+                f"VHA shape mismatch at {prefix!r}: q_proj {tuple(q_weight.shape)} "
+                f"vs premix {tuple(premix.shape)} under {num_heads} heads"
+            )
+        w = q_weight.float().view(physical, head_dim, -1)
+        folded = torch.stack(
+            [torch.matmul(pm.t(), w) for pm in premix.float().unbind(0)]
+        )
+        model_weights[q_key] = folded.reshape(
+            num_kv * physical * head_dim, w.shape[-1]
+        ).to(q_weight.dtype)
+        b_key = f"{prefix}.q_proj.bias"
+        if b_key in model_weights:
+            b = model_weights[b_key].float().view(physical, head_dim)
+            folded_b = torch.stack(
+                [torch.matmul(pm.t(), b) for pm in premix.float().unbind(0)]
+            )
+            model_weights[b_key] = folded_b.reshape(-1).to(model_weights[b_key].dtype)
+
+        o_key = f"{prefix}.o_proj.weight"
+        o_weight = model_weights[o_key]
+        if u.shape[0] != num_heads or v.shape != u.shape:
+            raise ValueError(
+                f"VHA postmix shape mismatch at {prefix!r}: u {tuple(u.shape)}, "
+                f"v {tuple(v.shape)} under {num_heads} heads"
+            )
+        m = u.float() @ v.float().t()
+        mix = torch.eye(num_heads, dtype=m.dtype) + m
+        w3 = o_weight.float().view(-1, num_heads, head_dim)
+        model_weights[o_key] = torch.matmul(
+            w3.permute(2, 0, 1), mix.t()
+        ).permute(1, 2, 0).reshape(o_weight.shape).to(o_weight.dtype)
+    return True
 
 
 def resolve_ffn_sharing(config) -> tuple | None:
@@ -1577,6 +1696,9 @@ class Qwen3DominoForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
         )
+        # None for plain-GQA checkpoints; otherwise the loader folds the
+        # VHA training parameterization back into q_proj/o_proj at load.
+        self._vha_physical = _resolve_vha_load_spec(self.config)
 
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.lm_head = ParallelLMHead(
@@ -1813,6 +1935,24 @@ class Qwen3DominoForCausalLM(nn.Module):
 
         self.has_own_embed_tokens = includes_embed_tokens
         self.has_own_lm_head = includes_lm_head
+
+        found_vha = fold_vha_weights(
+            model_weights,
+            num_heads=int(self.config.num_attention_heads),
+            head_dim=self.model.layers[0].self_attn.head_dim,
+        )
+        if self._vha_physical is not None and not found_vha:
+            raise ValueError(
+                "dflash_config.vha is set but the checkpoint carries no "
+                "vha_* parameters; either point at the VHA training "
+                "checkpoint or drop the key (already-folded exports)"
+            )
+        if self._vha_physical is None and found_vha:
+            raise ValueError(
+                "checkpoint carries vha_* parameters but dflash_config.vha "
+                "is unset; add the key (physical_q_heads) to the draft "
+                "config so the loader folds them"
+            )
 
         skip_substrs = ["fc.", "mask_embedding"]
         if not includes_embed_tokens:
