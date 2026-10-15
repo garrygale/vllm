@@ -1085,6 +1085,17 @@ class Qwen3DominoModel(nn.Module):
         self.out_proj_after_norm = bool(
             dflash_config.get("out_proj_after_norm", False)
         )
+        # Mirrors SpecForge's dflash_config.shared_emb_readout: base and
+        # correction read out through one emb-width bottleneck (W_down/W_up)
+        # plus the frozen lm_head. Load folds lm_head @ W_up into a single
+        # [V, emb] head and the correction loop adds in emb space.
+        self.shared_emb_readout = bool(
+            dflash_config.get("shared_emb_readout", False)
+        )
+        if self.shared_emb_readout and not self.out_proj_after_norm:
+            raise ValueError(
+                "shared_emb_readout requires out_proj_after_norm=true"
+            )
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.mask_token_id = dflash_config.get("mask_token_id")
 
@@ -1106,15 +1117,16 @@ class Qwen3DominoModel(nn.Module):
                 prefix=maybe_prefix(prefix, "input_proj"),
                 return_bias=False,
             )
-            self.output_proj = ReplicatedLinear(
-                self.config.hidden_size,
-                self.target_hidden_size,
-                bias=False,
-                params_dtype=vllm_config.model_config.dtype,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "output_proj"),
-                return_bias=False,
-            )
+            if not self.shared_emb_readout:
+                self.output_proj = ReplicatedLinear(
+                    self.config.hidden_size,
+                    self.target_hidden_size,
+                    bias=False,
+                    params_dtype=vllm_config.model_config.dtype,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "output_proj"),
+                    return_bias=False,
+                )
 
         current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
@@ -1194,34 +1206,78 @@ class Qwen3DominoModel(nn.Module):
         use_embed_proj = dflash_config.get("use_embed_proj", True)
         if use_embed_proj:
             self.emb_dim = dflash_config["emb_dim"]
-            z_dim = (
-                self.config.hidden_size
-                if self.out_proj_after_norm
-                else self.target_hidden_size
-            )
-            in_dim = z_dim + self.gru_hidden_dim
-            self.embed_proj = nn.Sequential(
-                ReplicatedLinear(
-                    in_dim,
+            if self.shared_emb_readout:
+                # Pure-linear GRU readout into the shared emb bottleneck; the
+                # prefix projection of z lives in head_down_proj and the
+                # lm_head @ head_up_proj product is folded at load.
+                self.embed_proj = ReplicatedLinear(
+                    self.gru_hidden_dim,
                     self.emb_dim,
                     bias=False,
                     params_dtype=vllm_config.model_config.dtype,
                     quant_config=self.quant_config,
-                    prefix=maybe_prefix(prefix, "embed_proj.0"),
+                    prefix=maybe_prefix(prefix, "embed_proj"),
                     return_bias=False,
-                ),
-                nn.SiLU(),
-                ParallelLMHead(
-                    self.vocab_size,
-                    self.emb_dim,
-                    params_dtype=vllm_config.model_config.dtype,
-                    quant_config=self.quant_config,
-                    prefix=maybe_prefix(prefix, "embed_proj.2"),
-                ),
-            )
+                )
+            else:
+                z_dim = (
+                    self.config.hidden_size
+                    if self.out_proj_after_norm
+                    else self.target_hidden_size
+                )
+                in_dim = z_dim + self.gru_hidden_dim
+                self.embed_proj = nn.Sequential(
+                    ReplicatedLinear(
+                        in_dim,
+                        self.emb_dim,
+                        bias=False,
+                        params_dtype=vllm_config.model_config.dtype,
+                        quant_config=self.quant_config,
+                        prefix=maybe_prefix(prefix, "embed_proj.0"),
+                        return_bias=False,
+                    ),
+                    nn.SiLU(),
+                    ParallelLMHead(
+                        self.vocab_size,
+                        self.emb_dim,
+                        params_dtype=vllm_config.model_config.dtype,
+                        quant_config=self.quant_config,
+                        prefix=maybe_prefix(prefix, "embed_proj.2"),
+                    ),
+                )
         else:
             self.emb_dim = None
             self.embed_proj = None
+
+        self.head_down_proj = None
+        self.head_up_proj = None
+        if self.shared_emb_readout:
+            if self.embed_proj is None:
+                raise ValueError(
+                    "shared_emb_readout requires use_embed_proj=true"
+                )
+            if dflash_config.get("use_hidden_proj", False):
+                raise ValueError(
+                    "shared_emb_readout is not compatible with use_hidden_proj"
+                )
+            self.head_down_proj = ReplicatedLinear(
+                self.config.hidden_size,
+                self.emb_dim,
+                bias=False,
+                params_dtype=vllm_config.model_config.dtype,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "head_down_proj"),
+                return_bias=False,
+            )
+            self.head_up_proj = ReplicatedLinear(
+                self.emb_dim,
+                self.target_hidden_size,
+                bias=False,
+                params_dtype=vllm_config.model_config.dtype,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "head_up_proj"),
+                return_bias=False,
+            )
 
         if dflash_config.get("use_hidden_proj", False):
             hidden_proj_dim = dflash_config.get(
@@ -1712,6 +1768,12 @@ class Qwen3DominoForCausalLM(nn.Module):
 
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
+            if self.model.shared_emb_readout:
+                raise ValueError(
+                    "shared_emb_readout requires draft_vocab_size == "
+                    "vocab_size (the folded head serves the full target "
+                    "vocab)"
+                )
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
                 requires_grad=False,
@@ -1750,11 +1812,27 @@ class Qwen3DominoForCausalLM(nn.Module):
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.model.out_proj_after_norm and self.model.output_proj is not None:
+        if self.model.shared_emb_readout:
+            # The lm_head is the folded [V, emb] head; the hidden must pass
+            # through head_down_proj first.
+            hidden_states = self.model.head_down_proj(hidden_states)
+        elif self.model.out_proj_after_norm and self.model.output_proj is not None:
             # Unfolded out_proj_after_norm fallback: output_proj survived load
             # because the lm_head was not foldable.
             hidden_states = self.model.output_proj(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def head_emb(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """[N, hidden] -> [N, emb] base part of the shared readout."""
+        return self.model.head_down_proj(hidden_states)
+
+    def correction_emb(self, gru_hidden: torch.Tensor) -> torch.Tensor:
+        """[B, gru] -> [B, emb] correction part of the shared readout."""
+        return self.model.embed_proj(gru_hidden)
+
+    def emb_logits(self, u: torch.Tensor) -> torch.Tensor:
+        """[B, emb] -> [B, V] through the folded shared head."""
+        return self.logits_processor(self.lm_head, u)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.compute_draft_logits(hidden_states)
@@ -1840,8 +1918,18 @@ class Qwen3DominoForCausalLM(nn.Module):
     def get_draft_attn_causal(self) -> list[bool]:
         return [layer.self_attn.causal for layer in self.model.layers]
 
+    @property
+    def shared_emb_readout(self) -> bool:
+        return self.model.shared_emb_readout
+
     def correction_bias(self, features: torch.Tensor) -> torch.Tensor:
         """Domino residual logit correction for ``[B, hidden + gru]`` features."""
+        if self.model.shared_emb_readout:
+            raise RuntimeError(
+                "correction_bias is the legacy two-path head; the "
+                "shared_emb_readout loop composes in emb space via "
+                "head_emb/correction_emb/emb_logits"
+            )
         bias = None
         if self.model.embed_proj is not None:
             x = self.model.embed_proj[0](features)
@@ -2023,6 +2111,54 @@ def _fold_output_proj_into_lm_head(draft_model: nn.Module) -> bool:
     return True
 
 
+def _fold_shared_emb_readout(draft_model: nn.Module) -> None:
+    """Fold the shared emb readout: ``W_lm @ W_up`` into a ``[V, emb]`` head.
+
+    Every correction-step projection (base + correction) then runs as one
+    emb-width GEMM on ``head_down_proj(z) + embed_proj(gru_state)``. There is
+    deliberately no unfolded fallback: without the fold each step would run
+    three vocab-width GEMMs (two of them full target-width), strictly worse
+    than the flag-off paths, so an unfoldable head raises instead.
+    """
+    model = draft_model.model
+    head = draft_model.lm_head
+    weight = getattr(head, "weight", None)
+    if (
+        head is None
+        or not isinstance(
+            getattr(head, "quant_method", None), UnquantizedEmbeddingMethod
+        )
+        or weight is None
+        or not weight.is_floating_point()
+    ):
+        raise RuntimeError(
+            "shared_emb_readout=true but the draft lm_head is not foldable "
+            "(missing, quantized or non-dense head); keep the lm_head out of "
+            "quantization or turn the flag off"
+        )
+
+    up_w = model.head_up_proj.weight.data
+    fused = torch.matmul(weight.data, up_w).to(weight.dtype)
+    new_head = ParallelLMHead(
+        head.num_embeddings,
+        up_w.shape[1],
+        params_dtype=weight.dtype,
+        padding_size=head.padding_size,
+        prefix="lm_head",
+    )
+    assert new_head.weight.shape[0] == fused.shape[0], (
+        f"folded shared-readout head shard {tuple(fused.shape)} does not "
+        f"match a fresh head shard {tuple(new_head.weight.shape)}"
+    )
+    new_head.weight = nn.Parameter(fused, requires_grad=False)
+    draft_model.lm_head = new_head
+    model.head_up_proj = None
+    logger.info(
+        "shared_emb_readout: folded lm_head @ head_up_proj into a "
+        f"{tuple(fused.shape)} emb-width head"
+    )
+
+
 def load_domino_model(
     target_model: nn.Module,
     vllm_config: VllmConfig,
@@ -2098,7 +2234,9 @@ def load_domino_model(
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
 
-    if getattr(draft_model.model, "out_proj_after_norm", False):
+    if getattr(draft_model.model, "shared_emb_readout", False):
+        _fold_shared_emb_readout(draft_model)
+    elif getattr(draft_model.model, "out_proj_after_norm", False):
         _fold_output_proj_into_lm_head(draft_model)
 
     return draft_model

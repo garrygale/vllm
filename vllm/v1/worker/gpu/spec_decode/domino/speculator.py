@@ -130,9 +130,17 @@ class DominoSpeculator(DSparkSpeculator):
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
 
-        base_logits = self.model.compute_draft_logits(sample_hidden)
-        vocab_size = base_logits.shape[-1]
-        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        shared = bool(getattr(self.model, "shared_emb_readout", False))
+        if shared:
+            # Shared emb readout: the whole vocab projection per step is the
+            # folded [V, emb] head applied to head_down_proj(z); base logits
+            # are never materialized in vocab space.
+            base_emb = self.model.head_emb(sample_hidden)
+            base_emb = base_emb.view(num_reqs, n_spec, -1)
+        else:
+            base_logits = self.model.compute_draft_logits(sample_hidden)
+            vocab_size = base_logits.shape[-1]
+            base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
@@ -154,8 +162,13 @@ class DominoSpeculator(DSparkSpeculator):
         prefix_ids[:, 0] = anchor
 
         for i in range(prefix_len):
+            logits_i = (
+                self.model.emb_logits(base_emb[:, i])
+                if shared
+                else base_logits[:, i]
+            )
             draft_i = self._sample_step(
-                base_logits[:, i],
+                logits_i,
                 idx_map[:, i],
                 sample_pos[:, i],
                 i,
@@ -168,11 +181,15 @@ class DominoSpeculator(DSparkSpeculator):
 
         sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
         for i in range(prefix_len, n_spec):
-            z_i = sample_hidden_3d[:, i]
-            s_i = gru_hidden[0]
-            features = torch.cat([z_i, s_i], dim=-1)
-            correction = self.model.correction_bias(features)
-            logits_i = base_logits[:, i] + correction
+            if shared:
+                u_i = base_emb[:, i] + self.model.correction_emb(gru_hidden[0])
+                logits_i = self.model.emb_logits(u_i)
+            else:
+                z_i = sample_hidden_3d[:, i]
+                s_i = gru_hidden[0]
+                features = torch.cat([z_i, s_i], dim=-1)
+                correction = self.model.correction_bias(features)
+                logits_i = base_logits[:, i] + correction
 
             draft_i = self._sample_step(
                 logits_i,

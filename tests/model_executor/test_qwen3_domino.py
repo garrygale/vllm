@@ -21,6 +21,7 @@ from vllm.model_executor.models.qwen3_domino import (
     RoutedOuterMLP,
     SharedGLUMLP,
     _fold_output_proj_into_lm_head,
+    _fold_shared_emb_readout,
     _resolve_vha_load_spec,
     fold_vha_weights,
     resolve_ffn_sharing,
@@ -644,6 +645,119 @@ def test_compute_draft_logits_projects_unfolded_hidden(
     draft.lm_head = folded.lm_head
     torch.testing.assert_close(
         draft.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
+    )
+
+
+def _shared_readout_draft(lm_head, head_down_proj, head_up_proj):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            shared_emb_readout=True,
+            out_proj_after_norm=True,
+            output_proj=None,
+            head_down_proj=head_down_proj,
+            head_up_proj=head_up_proj,
+        ),
+        lm_head=lm_head,
+    )
+
+
+def _tiny_shared_readout_heads(device):
+    H_d, M, H_t, V = 8, 4, 16, 32
+    lm_head = ParallelLMHead(V, H_t, prefix="lm_head")
+    head_down_proj = ReplicatedLinear(
+        H_d, M, bias=False, return_bias=False, prefix="model.head_down_proj"
+    )
+    head_up_proj = ReplicatedLinear(
+        M, H_t, bias=False, return_bias=False, prefix="model.head_up_proj"
+    )
+    with torch.no_grad():
+        lm_head.weight.normal_()
+        head_down_proj.weight.normal_()
+        head_up_proj.weight.normal_()
+    return lm_head, head_down_proj, head_up_proj, H_d, M, H_t, V
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+def test_shared_readout_fold_matches_two_path_sequence(
+    default_vllm_config, dist_init, device
+) -> None:
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    lm_head, head_down_proj, head_up_proj, H_d, M, H_t, V = (
+        _tiny_shared_readout_heads(device)
+    )
+    draft = _shared_readout_draft(lm_head, head_down_proj, head_up_proj)
+    _fold_shared_emb_readout(draft)
+    assert draft.model.head_up_proj is None
+    assert draft.lm_head is not lm_head
+    assert draft.lm_head.weight.shape == (V, M)
+
+    # u carries base + correction in emb space; the folded head must equal
+    # lm_head @ W_up applied after the fact.
+    z = torch.randn(4, H_d)
+    emb_corr = torch.randn(4, M)
+    u = F.linear(z, head_down_proj.weight) + emb_corr
+    expected = F.linear(F.linear(u, head_up_proj.weight), lm_head.weight)
+    torch.testing.assert_close(
+        F.linear(u, draft.lm_head.weight), expected, atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_shared_readout_fold_raises_on_unfoldable_head(
+    default_vllm_config, dist_init, device
+) -> None:
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+
+    lm_head, head_down_proj, head_up_proj, *_ = _tiny_shared_readout_heads(device)
+    lm_head.quant_method = object()  # not a dense unquantized head
+    draft = _shared_readout_draft(lm_head, head_down_proj, head_up_proj)
+    with pytest.raises(RuntimeError, match="not foldable"):
+        _fold_shared_emb_readout(draft)
+    assert draft.model.head_up_proj is head_up_proj
+    assert draft.lm_head is lm_head
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", DEVICES)
+def test_compute_draft_logits_routes_shared_readout_through_down_proj(
+    default_vllm_config, dist_init, device
+) -> None:
+    if current_platform.is_cuda_alike():
+        torch.accelerator.set_device_index(device)
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    lm_head, head_down_proj, head_up_proj, H_d, M, H_t, V = (
+        _tiny_shared_readout_heads(device)
+    )
+    draft = _shared_readout_draft(lm_head, head_down_proj, head_up_proj)
+    _fold_shared_emb_readout(draft)
+
+    holder = object.__new__(Qwen3DominoForCausalLM)
+    holder.model = draft.model
+    holder.lm_head = draft.lm_head
+    holder.logits_processor = LogitsProcessor(V)
+
+    hidden = torch.randn(4, H_d)
+    expected = F.linear(
+        F.linear(F.linear(hidden, head_down_proj.weight), head_up_proj.weight),
+        lm_head.weight,
+    )
+    torch.testing.assert_close(
+        holder.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        holder.emb_logits(F.linear(hidden, head_down_proj.weight)),
+        expected,
+        atol=1e-4,
+        rtol=1e-4,
     )
 
 
