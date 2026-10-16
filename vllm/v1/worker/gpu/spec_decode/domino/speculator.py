@@ -49,9 +49,16 @@ class DominoSpeculator(DSparkSpeculator):
         )
         self.num_draft_layers = hf_config.num_hidden_layers
 
-        # Domino uses the flare-fused context representation in the proposer
-        # buffer: [num_tokens, num_draft_layers * target_hidden_size].
-        self.hidden_size = self.num_draft_layers * self.target_hidden_size
+        # Context representation in the proposer buffer, matching
+        # ``combine_hidden_states``: flare fuses one routed feature per draft
+        # layer ([num_tokens, num_draft_layers * target_hidden_size]), fc
+        # projects the concatenated taps to draft width once and every layer
+        # reads that same feature ([num_tokens, hidden_size]).
+        self.fusion_mode = dflash_config.get("fusion_mode", "fc")
+        if self.fusion_mode == "flare":
+            self.hidden_size = self.num_draft_layers * self.target_hidden_size
+        else:
+            self.hidden_size = hf_config.hidden_size
         self.hidden_states = torch.zeros(
             self.max_num_tokens,
             self.hidden_size,

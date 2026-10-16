@@ -12,6 +12,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.models import qwen3_domino
 from vllm.model_executor.models.qwen3_domino import (
     DominoDraftAttention,
     DominoGroupedConv,
@@ -791,6 +792,7 @@ def _tap_norm_model(
                 # Distinct gains so a tap-index swap cannot pass.
                 norm.weight.fill_(0.5 + index)
     model = SimpleNamespace(
+        is_flare=True,
         num_target_features=num_target_features,
         target_hidden_size=target_hidden_size,
         aux_hidden_norms=norms,
@@ -902,4 +904,185 @@ def test_target_tap_norm_keys_fail_loudly_without_the_flag() -> None:
                 ("aux_hidden_norms.0.weight", torch.ones(8)),
                 ("fc.weight", torch.zeros(8, 24)),
             ]
+        )
+
+
+def _reference_rms_norm_into(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    """Stand-in for ``ops.rms_norm``: fp32 reduction, weight on last dims."""
+    xf = x.float()
+    variance = xf.pow(2).mean(dim=-1, keepdim=True)
+    normed = xf * torch.rsqrt(variance + eps)
+    if weight.numel() == x.shape[-1]:
+        normed = normed * weight
+    else:
+        pad = (1,) * (x.dim() - weight.dim())
+        normed = normed * weight.reshape(
+            *weight.shape[:-1], *pad, weight.shape[-1]
+        )
+    out.copy_(normed.to(out.dtype))
+
+
+def _fc_holder(
+    *,
+    tap_norm: bool,
+    num_target_features: int = 3,
+    target_hidden_size: int = 8,
+    draft_hidden: int = 12,
+) -> SimpleNamespace:
+    """The subset of Qwen3DominoModel that the fc fusion touches."""
+    torch.manual_seed(0)
+    norms = None
+    if tap_norm:
+        norms = torch.nn.ModuleList(
+            [
+                RMSNorm(target_hidden_size, eps=1e-6)
+                for _ in range(num_target_features)
+            ]
+        )
+        with torch.no_grad():
+            for index, norm in enumerate(norms):
+                norm.weight.fill_(0.5 + index)
+    fc = torch.nn.Linear(
+        num_target_features * target_hidden_size, draft_hidden
+    )
+    with torch.no_grad():
+        fc.weight.normal_(0, 0.05)
+    model = SimpleNamespace(
+        is_flare=False,
+        num_target_features=num_target_features,
+        target_hidden_size=target_hidden_size,
+        context_hidden_size=draft_hidden,
+        aux_hidden_norms=norms,
+        fc=fc,
+        hidden_norm=RMSNorm(draft_hidden, eps=1e-6),
+        layer_fusion_weights=None,
+        config=SimpleNamespace(num_hidden_layers=2, hidden_size=draft_hidden),
+    )
+    return SimpleNamespace(model=model)
+
+
+@torch.inference_mode()
+def test_fc_fusion_projects_the_normalized_taps_to_draft_width() -> None:
+    """fusion_mode='fc' returns one shared draft-width context feature."""
+    holder = _fc_holder(tap_norm=True)
+    hidden = torch.randn(4, 3 * 8)
+    taps = hidden.view(4, 3, 8)
+    normed = torch.stack(
+        [
+            _reference_rms_norm(taps[:, index, :], norm.weight)
+            for index, norm in enumerate(holder.model.aux_hidden_norms)
+        ],
+        dim=1,
+    )
+    expected = _reference_rms_norm(
+        holder.model.fc(normed.reshape(4, -1)), holder.model.hidden_norm.weight
+    )
+    actual = Qwen3DominoForCausalLM.combine_hidden_states(holder, hidden)
+    assert actual.shape == (4, holder.model.context_hidden_size)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    # A single row takes the squeeze path but the same projection.
+    torch.testing.assert_close(
+        Qwen3DominoForCausalLM.combine_hidden_states(holder, hidden[0]),
+        expected[0],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def _fake_projection_model(
+    *, is_flare: bool, num_layers: int = 2
+) -> SimpleNamespace:
+    """The subset of Qwen3DominoModel that ``_project_context_kv`` touches."""
+    torch.manual_seed(0)
+    draft_hidden, target_hidden = 12, 8
+    num_kv_heads, head_dim = 2, 4
+    kv_size = num_kv_heads * head_dim
+    width = target_hidden if is_flare else draft_hidden
+    model = SimpleNamespace(
+        is_flare=is_flare,
+        context_hidden_size=width,
+        _hidden_norm_weight=torch.rand(width) + 0.5,
+        _hidden_norm_eps=1e-6,
+        _k_norm_weights=torch.rand(num_layers, head_dim) + 0.5,
+        _rms_norm_eps=1e-6,
+    )
+    if is_flare:
+        model._fused_kv_weight_T = (
+            torch.randn(num_layers, target_hidden, 2 * kv_size) * 0.1
+        )
+        model._fused_kv_bias = None
+    else:
+        model._fused_kv_weight_flat = (
+            torch.randn(num_layers * 2 * kv_size, draft_hidden) * 0.1
+        )
+        model._fused_kv_bias_flat = None
+    return model
+
+
+@pytest.mark.parametrize("is_flare", [False, True])
+@torch.inference_mode()
+def test_context_kv_projection_matches_the_reference(is_flare: bool) -> None:
+    """Both fusion layouts must project and split K/V with layers outermost."""
+    model = _fake_projection_model(is_flare=is_flare, num_layers=2)
+    num_layers, num_ctx, nkv, hd = 2, 5, 2, 4
+    width = model.context_hidden_size
+    with patch.object(qwen3_domino.ops, "rms_norm", _reference_rms_norm_into):
+        if is_flare:
+            target = torch.randn(num_ctx, num_layers * width)
+            normed = _reference_rms_norm(
+                target.reshape(num_ctx * num_layers, width),
+                model._hidden_norm_weight,
+            ).view(num_ctx, num_layers, width)
+            expected = torch.bmm(
+                normed.permute(1, 0, 2), model._fused_kv_weight_T
+            ).view(num_layers, num_ctx, 2, nkv, hd)
+        else:
+            target = torch.randn(num_ctx, width)
+            normed = _reference_rms_norm(target, model._hidden_norm_weight)
+            expected = (
+                (normed @ model._fused_kv_weight_flat.t())
+                .view(num_ctx, num_layers, 2, nkv, hd)
+                .permute(1, 0, 2, 3, 4)
+            )
+        all_k, all_v = Qwen3DominoModel._project_context_kv(
+            model, target, num_ctx, num_layers, nkv, hd
+        )
+    assert all_k.shape == (num_layers, num_ctx, nkv, hd)
+    torch.testing.assert_close(all_k, expected[:, :, 0], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(all_v, expected[:, :, 1], rtol=1e-5, atol=1e-6)
+
+
+@torch.inference_mode()
+def test_context_kv_grouped_k_norm_keeps_the_fc_layout() -> None:
+    model = _fake_projection_model(is_flare=False, num_layers=2)
+    all_k = torch.randn(2, 5, 2, 4)
+    with patch.object(qwen3_domino.ops, "rms_norm", _reference_rms_norm_into):
+        normed_k = Qwen3DominoModel._normalize_context_k(model, all_k)
+    torch.testing.assert_close(
+        normed_k,
+        _reference_rms_norm(all_k, model._k_norm_weights),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+@torch.inference_mode()
+def test_precompute_rejects_the_wrong_context_layout() -> None:
+    fc_model = _fake_projection_model(is_flare=False)
+    fc_model._num_attn_layers = 2
+    fc_model._use_fused_context_kv = True
+    with pytest.raises(ValueError, match="fc-fused context states"):
+        Qwen3DominoModel.precompute_and_store_context_kv(
+            fc_model, torch.randn(3, 2 * fc_model.context_hidden_size), None
+        )
+
+    flare_model = _fake_projection_model(is_flare=True)
+    flare_model._num_attn_layers = 2
+    flare_model._use_fused_context_kv = True
+    with pytest.raises(ValueError, match="flare-fused context states"):
+        Qwen3DominoModel.precompute_and_store_context_kv(
+            flare_model, torch.randn(3, flare_model.context_hidden_size), None
         )

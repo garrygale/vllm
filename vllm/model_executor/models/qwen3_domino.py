@@ -10,10 +10,20 @@ lightweight causal correction head.  The correction head consists of:
     ``Linear(hidden + gru) -> emb_dim -> vocab``.
 
 The checkpoint format follows SpecForge's ``DFlashDraftModel`` with
-``dflash_config.projector_type == "domino"``.  The dflare variant additionally
-uses per-draft-layer softmax fusion of the target hidden states
-(``fusion_mode == "flare"``) and heterogeneous K/V projections
-(``heterogeneous_kv == true``).
+``dflash_config.projector_type == "domino"``.  Both target-fusion modes are
+served:
+
+  * ``fusion_mode == "flare"`` (dflare): per-draft-layer softmax fusion of the
+    target hidden states, target-width context features, usually with
+    heterogeneous K/V projections (``heterogeneous_kv == true``);
+  * ``fusion_mode == "fc"`` (plain DFlash, also the SpecForge default when the
+    key is absent): the concatenated target taps are projected to draft width
+    by one ``fc`` linear and every draft layer reads that shared feature
+    through its own K/V projections (shared with the draft stream unless
+    ``heterogeneous_kv`` is set).
+
+Both modes apply ``dflash_config.target_tap_norm`` (one RMSNorm per captured
+tap) before the fusion when the checkpoint was trained with it.
 """
 
 from collections.abc import Iterable
@@ -160,12 +170,14 @@ class DominoDraftAttention(Attention):
 
 
 class DominoQwen3Attention(nn.Module):
-    """Qwen3 attention with separate draft and target K/V projections.
+    """Qwen3 attention with optional dedicated target K/V projections.
 
-    The draft query block uses ``q_proj``/``k_proj``/``v_proj``.  The target
-    context K/V are projected separately with ``k_proj_target``/``v_proj_target``
-    and are pre-inserted into the KV cache before the draft forward, following
-    the DFlash contract.
+    The draft query block uses ``q_proj``/``k_proj``/``v_proj``.  With
+    heterogeneous K/V (``target_hidden_size`` given) the target context K/V are
+    projected separately with ``k_proj_target``/``v_proj_target`` and are
+    pre-inserted into the KV cache before the draft forward, following the
+    DFlash contract.  With ``target_hidden_size=None`` the context is projected
+    by the same shared ``k_proj``/``v_proj`` as the draft stream (fc fusion).
     """
 
     def __init__(
@@ -173,7 +185,7 @@ class DominoQwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        target_hidden_size: int,
+        target_hidden_size: int | None,
         rope_parameters: dict,
         max_position: int,
         head_dim: int | None = None,
@@ -230,22 +242,25 @@ class DominoQwen3Attention(nn.Module):
             prefix=f"{prefix}.v_proj",
             return_bias=False,
         )
-        self.k_proj_target = ColumnParallelLinear(
-            target_hidden_size,
-            self.total_num_kv_heads * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k_proj_target",
-            return_bias=False,
-        )
-        self.v_proj_target = ColumnParallelLinear(
-            target_hidden_size,
-            self.total_num_kv_heads * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v_proj_target",
-            return_bias=False,
-        )
+        self.k_proj_target = None
+        self.v_proj_target = None
+        if target_hidden_size is not None:
+            self.k_proj_target = ColumnParallelLinear(
+                target_hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.k_proj_target",
+                return_bias=False,
+            )
+            self.v_proj_target = ColumnParallelLinear(
+                target_hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.v_proj_target",
+                return_bias=False,
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -889,7 +904,7 @@ class DominoQwen3DecoderLayer(nn.Module):
         *,
         config: Qwen3Config,
         layer_idx: int,
-        target_hidden_size: int,
+        target_hidden_size: int | None,
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1063,10 +1078,15 @@ class Qwen3DominoModel(nn.Module):
             raise ValueError(
                 "Qwen3DominoModel requires dflash_config.projector_type == 'domino'"
             )
-        if dflash_config.get("fusion_mode") != "flare":
+        # SpecForge's DFlashDraftModel defaults to the fc (concat -> Linear)
+        # fusion when the key is absent; flare is the routed softmax variant.
+        fusion_mode = dflash_config.get("fusion_mode", "fc")
+        if fusion_mode not in ("fc", "flare"):
             raise NotImplementedError(
-                "Only fusion_mode='flare' is supported by Qwen3DominoModel"
+                "dflash_config.fusion_mode must be 'fc' or 'flare', got "
+                f"{fusion_mode!r}"
             )
+        self.is_flare = fusion_mode == "flare"
         if dflash_config.get("use_correction_target_fusion", False):
             raise NotImplementedError(
                 "use_correction_target_fusion is not implemented yet"
@@ -1079,6 +1099,33 @@ class Qwen3DominoModel(nn.Module):
         self.target_hidden_size = dflash_config.get(
             "target_hidden_size", self.config.hidden_size
         )
+        # Dedicated target K/V projections.  Flare checkpoints predate the key
+        # and always shipped them, so absent means dedicated for flare; fc
+        # defaults to the shared k_proj/v_proj that SpecForge trains with
+        # heterogeneous_kv=false.
+        self.heterogeneous_kv = bool(
+            dflash_config.get("heterogeneous_kv", self.is_flare)
+        )
+        # The fused context feature: flare keeps target width (one routed
+        # feature per draft layer), fc projects the concat to draft width and
+        # every layer reads the same feature.
+        self.context_hidden_size = (
+            self.target_hidden_size if self.is_flare else self.config.hidden_size
+        )
+        proj_input = (
+            self.target_hidden_size
+            if self.heterogeneous_kv
+            else self.config.hidden_size
+        )
+        if proj_input != self.context_hidden_size:
+            raise ValueError(
+                "dflash_config.heterogeneous_kv="
+                f"{self.heterogeneous_kv} needs the fused context feature "
+                f"({self.context_hidden_size}) to match the target K/V "
+                f"projection input ({proj_input}): fc needs "
+                "heterogeneous_kv=false unless target_hidden_size == "
+                "hidden_size, flare needs true unless they are equal"
+            )
         # Mirrors SpecForge's dflash_config.out_proj_after_norm: the final
         # norm runs at draft width and output_proj sits between it and the
         # lm_head (folded away at load time when the head allows it).
@@ -1135,7 +1182,13 @@ class Qwen3DominoModel(nn.Module):
                     current_vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
-                    target_hidden_size=self.target_hidden_size,
+                    # None: no dedicated target projections -- the fused context
+                    # feature goes through the shared k_proj/v_proj.
+                    target_hidden_size=(
+                        self.target_hidden_size
+                        if self.heterogeneous_kv
+                        else None
+                    ),
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(
@@ -1154,17 +1207,31 @@ class Qwen3DominoModel(nn.Module):
                     f"model={self.num_sinks}, layers={sorted(layer_sinks)}"
                 )
 
-        # Flare fusion: per-draft-layer softmax combination of target features.
-        self.layer_fusion_weights = nn.Parameter(
-            torch.empty(
-                self.config.num_hidden_layers,
-                self.num_target_features,
-                dtype=vllm_config.model_config.dtype,
+        if self.is_flare:
+            # Per-draft-layer softmax combination of the target features.
+            self.layer_fusion_weights = nn.Parameter(
+                torch.empty(
+                    self.config.num_hidden_layers,
+                    self.num_target_features,
+                    dtype=vllm_config.model_config.dtype,
+                )
             )
-        )
-        self._init_fusion_weights()
+            self._init_fusion_weights()
+            self.fc = None
+        else:
+            # fc fusion: one shared projection of the concatenated target taps.
+            self.layer_fusion_weights = None
+            self.fc = ReplicatedLinear(
+                self.num_target_features * self.target_hidden_size,
+                self.config.hidden_size,
+                bias=False,
+                params_dtype=vllm_config.model_config.dtype,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "fc"),
+                return_bias=False,
+            )
         self.hidden_norm = RMSNorm(
-            self.target_hidden_size, eps=self.config.rms_norm_eps
+            self.context_hidden_size, eps=self.config.rms_norm_eps
         )
         self.norm = RMSNorm(
             self.config.hidden_size
@@ -1386,7 +1453,13 @@ class Qwen3DominoModel(nn.Module):
         """
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
-        k_proj = attn0.k_proj_target
+        # Dedicated target projections when heterogeneous_kv, otherwise the
+        # context is projected by the same k_proj/v_proj as the draft stream.
+        k_proj = (
+            attn0.k_proj_target
+            if attn0.k_proj_target is not None
+            else attn0.k_proj
+        )
 
         if (
             self.quant_config is not None
@@ -1394,14 +1467,16 @@ class Qwen3DominoModel(nn.Module):
         ):
             logger.warning_once(
                 "Domino fused context-KV precompute requires unquantized "
-                "k_proj_target/v_proj_target; using the per-layer path."
+                "target K/V projections; using the per-layer path."
             )
             self._use_fused_context_kv = False
             # Drop fused buffers built from the unquantized weights so a later
             # rebuild (e.g. after on-the-fly quantization) frees the memory.
             for attr in (
                 "_fused_kv_weight_T",
+                "_fused_kv_weight_flat",
                 "_fused_kv_bias",
+                "_fused_kv_bias_flat",
                 "_k_norm_weights",
                 "_attn_layers",
                 "_rope_head_size",
@@ -1422,26 +1497,32 @@ class Qwen3DominoModel(nn.Module):
             return
 
         # KV projection weights, transposed for bmm:
-        # [num_layers, target_hidden_size, 2 * kv_size]
+        # [num_layers, context_width, 2 * kv_size]
         fused_kv_weights_T: list[torch.Tensor] = []
+        fused_kv_weights: list[torch.Tensor] = []
         fused_kv_biases: list[torch.Tensor] = []
         has_bias = k_proj.bias is not None
         for attn in layers_attn:
+            k_proj_i = (
+                attn.k_proj_target
+                if attn.k_proj_target is not None
+                else attn.k_proj
+            )
+            v_proj_i = (
+                attn.v_proj_target
+                if attn.v_proj_target is not None
+                else attn.v_proj
+            )
             kv_weight = torch.cat(
-                [
-                    attn.k_proj_target.weight.data,
-                    attn.v_proj_target.weight.data,
-                ],
+                [k_proj_i.weight.data, v_proj_i.weight.data],
                 dim=0,
             )
             fused_kv_weights_T.append(kv_weight.t().contiguous())
+            fused_kv_weights.append(kv_weight)
             if has_bias:
                 fused_kv_biases.append(
                     torch.cat(
-                        [
-                            attn.k_proj_target.bias.data,
-                            attn.v_proj_target.bias.data,
-                        ],
+                        [k_proj_i.bias.data, v_proj_i.bias.data],
                         dim=0,
                     )
                 )
@@ -1449,6 +1530,16 @@ class Qwen3DominoModel(nn.Module):
         self._fused_kv_bias = (
             torch.stack(fused_kv_biases, dim=0) if has_bias else None
         )
+        # fc reads one shared context feature for every layer, so the stacked
+        # per-layer projections collapse to a single [D * 2kv, H] GEMM.
+        if self.is_flare:
+            self._fused_kv_weight_flat = None
+            self._fused_kv_bias_flat = None
+        else:
+            self._fused_kv_weight_flat = torch.cat(fused_kv_weights, dim=0)
+            self._fused_kv_bias_flat = (
+                torch.cat(fused_kv_biases, dim=0) if has_bias else None
+            )
 
         self._hidden_norm_weight = self.hidden_norm.weight.data
         self._hidden_norm_eps = self.hidden_norm.variance_epsilon
@@ -1499,29 +1590,49 @@ class Qwen3DominoModel(nn.Module):
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # --- Fused KV projection (one batched GEMM for all layers) ---
-        # All layers share the same hidden_norm, so the [T, D, H] context is
-        # flattened to [T*D, H], normalized with a single kernel, then
-        # projected through the per-layer K/V weights with one bmm.
-        H = self.target_hidden_size
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states.view(num_ctx * num_layers, H),
-            context_states.reshape(num_ctx * num_layers, H),
-            self._hidden_norm_weight,
-            self._hidden_norm_eps,
-        )
-        fused = normed_context_states.view(num_ctx, num_layers, H)
-        all_kv_flat = torch.bmm(
-            fused.permute(1, 0, 2).contiguous(), self._fused_kv_weight_T
-        )
-        if self._fused_kv_bias is not None:
-            all_kv_flat = all_kv_flat + self._fused_kv_bias.unsqueeze(1)
-        # [D, T, 2, nkv, hd]; dim-2 slices are contiguous K and V.
-        all_kv = all_kv_flat.view(
-            num_layers, num_ctx, 2, num_kv_heads, head_dim
-        )
-        all_k = all_kv[:, :, 0]  # [D, T, nkv, hd], contiguous
-        all_v = all_kv[:, :, 1]  # [D, T, nkv, hd], contiguous
+        if self.is_flare:
+            # All layers share the same hidden_norm, so the [T, D, H] context is
+            # flattened to [T*D, H], normalized with a single kernel, then
+            # projected through the per-layer K/V weights with one bmm.
+            H = self.context_hidden_size
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states.view(num_ctx * num_layers, H),
+                context_states.reshape(num_ctx * num_layers, H),
+                self._hidden_norm_weight,
+                self._hidden_norm_eps,
+            )
+            fused = normed_context_states.view(num_ctx, num_layers, H)
+            all_kv_flat = torch.bmm(
+                fused.permute(1, 0, 2).contiguous(), self._fused_kv_weight_T
+            )
+            if self._fused_kv_bias is not None:
+                all_kv_flat = all_kv_flat + self._fused_kv_bias.unsqueeze(1)
+            # [D, T, 2, nkv, hd]; dim-2 slices are contiguous K and V.
+            all_kv = all_kv_flat.view(
+                num_layers, num_ctx, 2, num_kv_heads, head_dim
+            )
+        else:
+            # fc: one shared context feature of draft width, every layer
+            # projects it with its own (shared with the draft stream) K/V
+            # weights -- one plain GEMM against the stacked [D * 2kv, H] weight.
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states,
+                context_states,
+                self._hidden_norm_weight,
+                self._hidden_norm_eps,
+            )
+            all_kv_flat = F.linear(
+                normed_context_states,
+                self._fused_kv_weight_flat,
+                self._fused_kv_bias_flat,
+            )
+            all_kv = all_kv_flat.view(
+                num_ctx, num_layers, 2, num_kv_heads, head_dim
+            ).permute(1, 0, 2, 3, 4)
+        all_k = all_kv[:, :, 0]  # [D, T, nkv, hd]
+        all_v = all_kv[:, :, 1]
         return all_k, all_v
 
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
@@ -1542,20 +1653,28 @@ class Qwen3DominoModel(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
-        """Project flare-fused context states and write them into draft KV caches.
+        """Project fused context states and write them into draft KV caches.
 
         ``context_states`` is the output of
-        :meth:`Qwen3DominoForCausalLM.combine_hidden_states`, shaped
-        ``[T, D * target_hidden_size]``.
+        :meth:`Qwen3DominoForCausalLM.combine_hidden_states`: ``[T, D * H_t]``
+        for flare (one routed feature per draft layer) or ``[T, H_d]`` for fc
+        (one shared feature read by every layer).
 
         The fused path projects all layers with one batched GEMM, applies a
         grouped k-norm and a fused RoPE, then inserts each layer's K/V into its
         cache.
         """
-        if context_states.dim() != 2:
+        expected_width = (
+            self.config.num_hidden_layers * self.context_hidden_size
+            if self.is_flare
+            else self.context_hidden_size
+        )
+        if context_states.dim() != 2 or context_states.shape[-1] != expected_width:
             raise ValueError(
-                "Domino precompute expects 2D flare-fused context states, got "
-                f"{context_states.shape}"
+                "Domino precompute expects 2D "
+                f"{'flare-fused' if self.is_flare else 'fc-fused'} context "
+                f"states of width {expected_width}, got "
+                f"{tuple(context_states.shape)}"
             )
 
         if not hasattr(self, "_num_attn_layers"):
@@ -1631,15 +1750,36 @@ class Qwen3DominoModel(nn.Module):
         """Per-layer fallback of :meth:`precompute_and_store_context_kv`."""
         num_ctx = context_states.shape[0]
         D = self.config.num_hidden_layers
-        H = self.target_hidden_size
-        fused = context_states.view(num_ctx, D, H)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
+        if self.is_flare:
+            H = self.context_hidden_size
+            fused = context_states.view(num_ctx, D, H)
+            shared_ctx = None
+        else:
+            fused = None
+            # fc: normalize the one shared feature once, then project it with
+            # every layer's own K/V weights.
+            shared_ctx = self.hidden_norm(context_states)
 
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
-            ctx = self.hidden_norm(fused[:, i, :])
-            k = attn.k_proj_target(ctx)
-            v = attn.v_proj_target(ctx)
+            ctx = (
+                self.hidden_norm(fused[:, i, :])
+                if self.is_flare
+                else shared_ctx
+            )
+            k_proj = (
+                attn.k_proj_target
+                if attn.k_proj_target is not None
+                else attn.k_proj
+            )
+            v_proj = (
+                attn.v_proj_target
+                if attn.v_proj_target is not None
+                else attn.v_proj
+            )
+            k = k_proj(ctx)
+            v = v_proj(ctx)
             k_shape = k.shape
             k = attn.k_norm(
                 k.view(
@@ -1856,10 +1996,13 @@ class Qwen3DominoForCausalLM(nn.Module):
         return draft_ids + self.draft_id_to_target_id[draft_ids]
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Flare-fuse raw target aux features into per-draft-layer states.
+        """Fuse raw target aux features into the draft context feature(s).
 
         Input: ``[N, num_target_features * target_hidden_size]``.
-        Output: ``[N, num_draft_layers * target_hidden_size]``.
+
+        Output: ``[N, num_draft_layers * target_hidden_size]`` for flare (one
+        routed feature per draft layer) or ``[N, hidden_size]`` for fc (one
+        shared feature projected from the concatenated taps).
         """
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
@@ -1888,6 +2031,15 @@ class Qwen3DominoForCausalLM(nn.Module):
             for index, norm in enumerate(self.model.aux_hidden_norms):
                 normed[:, index, :] = norm(target[:, index, :])
             target = normed
+        if not self.model.is_flare:
+            # fc fusion: project the normalized concat to draft width once and
+            # normalize; every draft layer reads this same feature.
+            fused = self.model.hidden_norm(
+                self.model.fc(target.reshape(target.shape[0], -1))
+            )
+            if needs_squeeze:
+                fused = fused.squeeze(0)
+            return fused
         fusion_w = torch.softmax(self.model.layer_fusion_weights, dim=1)
         # [D, T] @ [N, T, H] -> [N, D, H] (broadcast matmul, no
         # materialization of [N, D, T, H]).  Plain matmul instead of einsum:
@@ -1907,7 +2059,7 @@ class Qwen3DominoForCausalLM(nn.Module):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
-        """Project flare-fused context states and write them into draft KV caches."""
+        """Project the fused context states and write them into draft KV caches."""
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
@@ -2042,7 +2194,10 @@ class Qwen3DominoForCausalLM(nn.Module):
                 "config so the loader folds them"
             )
 
-        skip_substrs = ["fc.", "mask_embedding"]
+        skip_substrs = ["mask_embedding"]
+        if self.model.is_flare:
+            # flare checkpoints ship layer_fusion_weights instead of fc.
+            skip_substrs.append("fc.")
         if not includes_embed_tokens:
             skip_substrs.append("embed_tokens")
         if not includes_lm_head:
