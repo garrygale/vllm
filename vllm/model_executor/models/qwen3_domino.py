@@ -2176,6 +2176,33 @@ class Qwen3DominoForCausalLM(nn.Module):
         self.has_own_embed_tokens = includes_embed_tokens
         self.has_own_lm_head = includes_lm_head
 
+        # shared_emb_readout is a different parameterization, not a
+        # re-parameterization of the legacy two-path head: the draft-owned
+        # vocab matrix (embed_proj.2) has no counterpart in the shared head.
+        # Catch the mismatch here instead of letting AutoWeightsLoader emit
+        # its generic "no module named embed_proj.0" error.
+        has_legacy_head = any(
+            "embed_proj.0." in name or "embed_proj.2." in name
+            for name in model_weights
+        )
+        has_shared_head = any(
+            name == "model.head_down_proj.weight" for name in model_weights
+        )
+        if self.model.shared_emb_readout and (has_legacy_head or not has_shared_head):
+            raise ValueError(
+                "shared_emb_readout=true but the draft checkpoint carries "
+                "the legacy two-path correction head (embed_proj.0/.2). "
+                "The shared head must be trained from scratch with the "
+                "flag; serve legacy checkpoints with the flag off."
+            )
+        if not self.model.shared_emb_readout and has_shared_head:
+            raise ValueError(
+                "the draft checkpoint carries shared_emb_readout "
+                "parameters (head_down_proj) but "
+                "dflash_config.shared_emb_readout is off; enable the flag "
+                "in the draft config."
+            )
+
         found_vha = fold_vha_weights(
             model_weights,
             num_heads=int(self.config.num_attention_heads),
