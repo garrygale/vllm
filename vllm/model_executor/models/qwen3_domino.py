@@ -590,7 +590,6 @@ class DominoQwen3Attention(nn.Module):
                 rms_norm_eps=rms_norm_eps,
                 prefix=f"{prefix}.hca_compressor",
             )
-        self._cache_block_size = getattr(cache_config, "block_size", None) or 0
         # Persistent entry pool [max_num_seqs, max_entries, hd]; allocated by
         # the model and written in place every round so CUDA graphs baked into
         # the dense read path keep valid pointers.
@@ -620,6 +619,30 @@ class DominoQwen3Attention(nn.Module):
         output = self.o_proj(attn_output)
         return output
 
+    def _hca_metadata(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(query_start_loc, block_table) for the current draft forward.
+
+        CUDA's forward context carries the CommonAttentionMetadata object;
+        vLLM-Ascend carries a per-layer dict (list of dicts under multi-step
+        drafting) whose entries expose the same segmentation with Ascend's
+        ``block_tables`` spelling. Every layer of one draft forward shares the
+        segmentation, so any entry serves the dense path.
+        """
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, (list, tuple)):
+            metadata = metadata[0]
+        if isinstance(metadata, dict):
+            for key in (self.layer_name, f"{self.layer_name}.attn"):
+                if key in metadata:
+                    metadata = metadata[key]
+                    break
+            else:
+                metadata = next(iter(metadata.values()))
+        block_table = getattr(metadata, "block_table_tensor", None)
+        if block_table is None:
+            block_table = metadata.block_tables
+        return metadata.query_start_loc, block_table
+
     def _hca_dense_attention(
         self,
         positions: torch.Tensor,
@@ -640,19 +663,25 @@ class DominoQwen3Attention(nn.Module):
         spec = self.hca
         W = spec["window"]
         hop = spec["hop"]
-        max_entries = spec["max_entries"]
 
-        cad = get_forward_context().attn_metadata
-        query_start_loc = cad.query_start_loc
+        query_start_loc, block_table = self._hca_metadata()
         num_reqs = query_start_loc.numel() - 1
         num_query = q.shape[0] // num_reqs
         assert num_reqs * num_query == q.shape[0], (
             "HCA dense attention requires the uniform per-request query count "
             "of parallel drafting"
         )
-        block_size = self._cache_block_size
-        block_table = cad.block_table_tensor
-        k_cache, v_cache = self.attn.kv_cache
+        # Cache layout differs per platform: CUDA hands [k, v] with shape
+        # [num_blocks, block, nkv*hd]; vLLM-Ascend hands one
+        # (2, num_blocks, block, nkv, hd) tensor whose [0]/[1] are K/V. The
+        # gather block size comes from the tensor (Ascend pads blocks to 128).
+        kv_caches = self.attn.kv_cache
+        if len(kv_caches) == 1:
+            k_cache, v_cache = kv_caches[0][0], kv_caches[0][1]
+            block_size = kv_caches[0].shape[2]
+        else:
+            k_cache, v_cache = kv_caches
+            block_size = k_cache.shape[1]
         entries_k, entries_v, pool_first, pool_stored = self._hca_pool
         capacity = entries_k.shape[1]
         kv_heads = self.num_kv_heads
@@ -685,12 +714,12 @@ class DominoQwen3Attention(nn.Module):
         band_blocks = torch.gather(block_table, 1, block_ids)
         k_band = (
             k_cache[band_blocks, band_slots]
-            .view(num_reqs, W, kv_heads, head_dim)
+            .reshape(num_reqs, W, kv_heads, head_dim)
             .transpose(1, 2)
         )
         v_band = (
             v_cache[band_blocks, band_slots]
-            .view(num_reqs, W, kv_heads, head_dim)
+            .reshape(num_reqs, W, kv_heads, head_dim)
             .transpose(1, 2)
         )
 
@@ -736,15 +765,17 @@ class DominoQwen3Attention(nn.Module):
         # trailing num_query always-visible columns.
         mask = F.pad(mask, (0, num_query))
 
-        attn_output = F.scaled_dot_product_attention(
-            q4,
-            k_all,
-            v_all,
-            attn_mask=mask,
-            scale=self.scaling,
-            enable_gqa=True,
+        # Grouped matmul over GQA (no sdpa enable_gqa: torch_npu support is
+        # unverified); scores/mask are small at draft sizes.
+        group = self.num_heads // kv_heads
+        q_grouped = q4.reshape(num_reqs, kv_heads, group, num_query, head_dim)
+        scores = torch.matmul(
+            q_grouped, k_all.transpose(-1, -2).unsqueeze(2)
         )
-        return attn_output.transpose(1, 2).reshape(
+        scores = scores * self.scaling + mask.unsqueeze(1)
+        probs = torch.softmax(scores.float(), dim=-1).to(k_all.dtype)
+        out = torch.matmul(probs, v_all.unsqueeze(2))
+        return out.permute(0, 3, 1, 2, 4).reshape(
             num_reqs * num_query, self.num_heads * head_dim
         )
 
@@ -1928,14 +1959,11 @@ class Qwen3DominoModel(nn.Module):
                 if hasattr(self, attr):
                     delattr(self, attr)
             # Mark the fused decision as made so the precompute does not
-            # re-attempt the build on every step.
+            # re-attempt the build on every step. HCA pooling is checked at
+            # precompute time instead: vLLM-Ascend's wrapper can still enable
+            # its own quantized fused context-KV path after this build.
             self._num_attn_layers = len(layers_attn)
-            if self.layer_hca_specs is not None:
-                raise NotImplementedError(
-                    "HCA (heavily_compressed_attention) drafts require the "
-                    "unquantized fused context-KV precompute; quantized "
-                    "context K/V projections are unsupported (v1)."
-                )
+            self._build_hca_pools()
             return
 
         # KV projection weights, transposed for bmm:
@@ -2226,6 +2254,13 @@ class Qwen3DominoModel(nn.Module):
             self._build_fused_kv_buffers()
 
         if not self._use_fused_context_kv:
+            if self.layer_hca_specs is not None:
+                raise NotImplementedError(
+                    "HCA (heavily_compressed_attention) drafts require a "
+                    "fused context-KV precompute (bf16, or vLLM-Ascend's "
+                    "quantized w4a8/w8a8 fused path); the per-layer fallback "
+                    "carries no pooling buffers (v1)."
+                )
             self._precompute_and_store_context_kv_per_layer(
                 context_states, context_positions, context_slot_mapping
             )
