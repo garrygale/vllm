@@ -676,7 +676,10 @@ class DominoQwen3Attention(nn.Module):
         # (2, num_blocks, block, nkv, hd) tensor whose [0]/[1] are K/V. The
         # gather block size comes from the tensor (Ascend pads blocks to 128).
         kv_caches = self.attn.kv_cache
-        if len(kv_caches) == 1:
+        if isinstance(kv_caches, torch.Tensor) and kv_caches.dim() == 5:
+            k_cache, v_cache = kv_caches[0], kv_caches[1]
+            block_size = kv_caches.shape[2]
+        elif len(kv_caches) == 1:
             k_cache, v_cache = kv_caches[0][0], kv_caches[0][1]
             block_size = kv_caches[0].shape[2]
         else:
