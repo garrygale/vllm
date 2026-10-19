@@ -60,6 +60,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.v1.forward_context import get_forward_context
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -91,11 +92,12 @@ def _domino_layer_attention(
     """Resolve (sliding_window, causal) for one Domino draft layer.
 
     A layer uses sliding-window attention when its ``config.layer_types``
-    entry is ``"sliding_attention"``.  The window is the per-layer entry of
-    ``config.sliding_window`` (a list with one value per draft layer) or the
-    scalar value shared by all sliding layers, mirroring SpecForge's
-    ``get_layer_sliding_window``: ``-1``/missing/invalid entries resolve to
-    ``None`` (full attention).
+    entry is ``"sliding_attention"``; a ``"heavily_compressed_attention"``
+    (HCA) layer resolves its raw-band window the same way.  The window is the
+    per-layer entry of ``config.sliding_window`` (a list with one value per
+    draft layer) or the scalar value shared by all sliding layers, mirroring
+    SpecForge's ``get_layer_sliding_window``: ``-1``/missing/invalid entries
+    resolve to ``None`` (full attention).
 
     Domino draft layers are trained with block-bidirectional (non-causal)
     attention on every layer, so the default is non-causal; a
@@ -107,7 +109,7 @@ def _domino_layer_attention(
     layer_types = getattr(config, "layer_types", None)
     if not layer_types or layer_idx >= len(layer_types):
         return None, causal
-    if layer_types[layer_idx] != "sliding_attention":
+    if layer_types[layer_idx] not in ("sliding_attention", "heavily_compressed_attention"):
         return None, causal
 
     # The config loader relocates a per-layer list from the top-level
@@ -140,6 +142,242 @@ def domino_has_any_non_causal(config: Qwen3Config) -> bool:
         _domino_layer_attention(config, layer_idx)[1]
         for layer_idx in range(config.num_hidden_layers)
     )
+
+
+# ---------------------------------------------------------------------------
+# Heavily compressed attention (HCA): compressed history entries beside the
+# raw band (``dflash_config.hca``, layer_types "heavily_compressed_attention")
+# ---------------------------------------------------------------------------
+#
+# Serving mirror of SpecForge's ``resolve_hca_config``/``DFlashHCACompressor``.
+# A compressed layer attends [entries || raw band || draft block] with the R2
+# seam rule: the band keeps the constant-width per-layer window W, entry j is
+# visible to query t iff ``j*hop < t+1-W`` (and, past the entry budget, only
+# the newest ``max_entries`` entries are kept). The DFlash contract re-projects
+# the whole context every round, so the entry pool is simply re-pooled from
+# the fresh context feature at each precompute pass -- no incremental state.
+
+_HCA_COFF = {"vanilla": 1, "hat": 2}
+HCA_WINDOW_BUDGET = 2048
+_HCA_FIELDS = {"variants", "hops", "bias_mode", "max_entries"}
+
+
+def _hat_window_kernel(win: int) -> torch.Tensor:
+    idx = torch.arange(win, dtype=torch.float32)
+    center = (win - 1) / 2
+    kernel = torch.clamp_min(1.0 - (idx - center).abs() / (win / 2), min=0.0)
+    return kernel / kernel.sum()
+
+
+def resolve_domino_hca(config: Qwen3Config) -> Optional[tuple]:
+    """Resolve dflash_config.hca into per-layer specs; None when disabled."""
+
+    dflash_config = _dflash_config(config)
+    layer_types = list(getattr(config, "layer_types", None) or [])
+    num_layers = config.num_hidden_layers
+    compressed = [
+        idx
+        for idx in range(num_layers)
+        if layer_types[idx] == "heavily_compressed_attention"
+    ]
+    raw = dflash_config.get("hca")
+    if not compressed:
+        if raw is not None:
+            raise ValueError(
+                "dflash_config.hca is set but no layer_type is "
+                "'heavily_compressed_attention'; remove the key or mark layers."
+            )
+        return None
+    if raw is None:
+        raise ValueError(
+            "layer_types 'heavily_compressed_attention' requires "
+            "dflash_config.hca with 'variants' and optional 'hops'."
+        )
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"dflash_config.hca must be a dict, got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - _HCA_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"unknown dflash_config.hca entries {unknown}; expected a subset "
+            f"of {sorted(_HCA_FIELDS)}"
+        )
+    if bool(dflash_config.get("causal", False)):
+        raise ValueError(
+            "HCA layers require the non-causal domino band (v1): the dense "
+            "[entries || band || draft] path assumes block-bidirectional "
+            "draft columns."
+        )
+    if int(dflash_config.get("attn_sink", 0) or 0):
+        raise ValueError(
+            "HCA layers do not support dflash_config.attn_sink (v1): sinks "
+            "ride the paged cache as extra rows, which the dense HCA read "
+            "path does not visit."
+        )
+
+    block_size = getattr(config, "block_size", None)
+    if not isinstance(block_size, int) or isinstance(block_size, bool):
+        raise ValueError("dflash_config.hca requires an integer block_size")
+
+    variants = raw.get("variants", "vanilla")
+    if isinstance(variants, str):
+        variants = [variants] * len(compressed)
+    if not isinstance(variants, (list, tuple)) or len(variants) != len(compressed):
+        raise ValueError(
+            f"dflash_config.hca.variants must be a variant or a list of "
+            f"{len(compressed)} (one per compressed layer), got {variants!r}"
+        )
+    hops = raw.get("hops", 128)
+    if isinstance(hops, int) and not isinstance(hops, bool):
+        hops = [hops] * len(compressed)
+    if not isinstance(hops, (list, tuple)) or len(hops) != len(compressed):
+        raise ValueError(
+            f"dflash_config.hca.hops must be an int or a list of "
+            f"{len(compressed)} positive ints, got {hops!r}"
+        )
+    bias_mode = raw.get("bias_mode", "learnable")
+    if bias_mode not in ("learnable", "frozen"):
+        raise ValueError(
+            f"dflash_config.hca.bias_mode must be 'learnable' or 'frozen', "
+            f"got {bias_mode!r}"
+        )
+    max_entries = raw.get("max_entries")
+    if max_entries is not None and (
+        not isinstance(max_entries, int)
+        or isinstance(max_entries, bool)
+        or max_entries < 1
+    ):
+        raise ValueError(
+            f"dflash_config.hca.max_entries must be a positive int, got "
+            f"{max_entries!r}"
+        )
+
+    specs: list[Optional[dict]] = [None] * num_layers
+    for slot, layer_idx in enumerate(compressed):
+        variant = variants[slot]
+        if variant not in _HCA_COFF:
+            raise ValueError(
+                f"dflash_config.hca.variants supports {sorted(_HCA_COFF)} for "
+                f"layer {layer_idx}, got {variant!r}"
+            )
+        hop = hops[slot]
+        if not isinstance(hop, int) or isinstance(hop, bool) or hop < 1:
+            raise ValueError(
+                f"dflash_config.hca.hops[{slot}] must be a positive int for "
+                f"layer {layer_idx}, got {hop!r}"
+            )
+        coff = _HCA_COFF[variant]
+        win = coff * hop
+        window = _domino_layer_attention(config, layer_idx)[0]
+        if window is None:
+            raise ValueError(
+                f"Layer {layer_idx} is heavily_compressed_attention but no "
+                "positive sliding_window is configured for its raw band."
+            )
+        if window > HCA_WINDOW_BUDGET:
+            raise ValueError(
+                f"Layer {layer_idx} is heavily_compressed_attention with "
+                f"sliding_window={window} > {HCA_WINDOW_BUDGET} (the served "
+                "band budget); lower the window, the history goes compressed."
+            )
+        if window < win + block_size:
+            raise ValueError(
+                f"Layer {layer_idx} is heavily_compressed_attention with "
+                f"window {window} < win({win}) + block_size({block_size}); "
+                "the seam between band and entries would drop tokens."
+            )
+        entries = max_entries
+        if entries is None:
+            entries = HCA_WINDOW_BUDGET - window - block_size - 64
+        if entries < 1:
+            raise ValueError(
+                f"Layer {layer_idx} has no compressed-entry budget left "
+                f"(window {window} + block_size {block_size} consumes the "
+                f"{HCA_WINDOW_BUDGET} attention budget)."
+            )
+        specs[layer_idx] = {
+            "variant": variant,
+            "hop": hop,
+            "win": win,
+            "coff": coff,
+            "bias_mode": bias_mode,
+            "max_entries": entries,
+            "window": window,
+        }
+    return tuple(specs)
+
+
+class DominoHCACompressor(nn.Module):
+    """Per-layer compressed-entry pooler over the fused context feature.
+
+    Same recipe as SpecForge's ``DFlashHCACompressor``: every closed ``win``
+    window emits ``RMSNorm(sum_j softmax(gate_j + B)_j * kv_j)`` with one
+    shared head. ``position_bias`` mirrors the training parameter verbatim
+    (zero init = vanilla, log tent init = hat). K/V are stored unrotated; the
+    owning attention rotates the K view at the anchor positions.
+    """
+
+    def __init__(
+        self,
+        context_hidden_size: int,
+        head_dim: int,
+        spec: dict,
+        rms_norm_eps: float = 1e-6,
+        dtype: torch.dtype | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hop = spec["hop"]
+        self.win = spec["win"]
+        self.anchor_offset = 0 if spec["coff"] == 1 else spec["win"] // 2
+        self.kv_proj = ReplicatedLinear(
+            context_hidden_size,
+            head_dim,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}.kv_proj",
+            return_bias=False,
+        )
+        self.gate_proj = ReplicatedLinear(
+            context_hidden_size,
+            head_dim,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}.gate_proj",
+            return_bias=False,
+        )
+        bias = torch.zeros(self.win, head_dim, dtype=torch.float32)
+        if spec["variant"] == "hat":
+            bias = bias + torch.log(_hat_window_kernel(self.win) + 1e-8).unsqueeze(
+                -1
+            )
+        self.position_bias = nn.Parameter(bias, requires_grad=False)
+        self.norm = RMSNorm(head_dim, eps=rms_norm_eps)
+
+    def pool(self, feature: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Pool one request's context feature [S, H] into unrotated entries."""
+
+        capacity = (feature.shape[0] - self.win) // self.hop + 1
+        if capacity <= 0:
+            return feature.new_zeros(0, self.kv_proj.output_size), 0
+        kv = self.kv_proj(feature)[0]
+        gate = self.gate_proj(feature)[0]
+        # [S, hd, win] with hop stride; slice to the closed windows only.
+        kv_windows = kv.unfold(0, self.win, self.hop)[:capacity]
+        gate_windows = gate.unfold(0, self.win, self.hop)[:capacity]
+        weights = torch.softmax(
+            gate_windows + self.position_bias.t().unsqueeze(0),
+            dim=-1,
+            dtype=torch.float32,
+        ).to(kv_windows.dtype)
+        pooled = self.norm((kv_windows * weights).sum(dim=-1))
+        return pooled, capacity
+
+    def anchor_positions(self, num_entries: int, device) -> torch.Tensor:
+        return (
+            torch.arange(num_entries, device=device) * self.hop + self.anchor_offset
+        )
 
 
 class DominoDraftAttention(Attention):
@@ -194,6 +432,7 @@ class DominoQwen3Attention(nn.Module):
         sliding_window: int | None = None,
         causal: bool = False,
         num_sinks: int = 0,
+        hca: dict | None = None,
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -329,6 +568,33 @@ class DominoQwen3Attention(nn.Module):
         # layers additionally restrict the context part of the mask to the
         # last ``sliding_window`` KV positions.
         self.causal = causal
+        # HCA (heavily_compressed_attention): compressed history entries read
+        # through a dense [entries || band || draft block] attention instead of
+        # the paged band call. The band call below still runs (it owns the
+        # query K/V cache write and the runner's accounting); its output is
+        # replaced by the dense path whenever the entry pool is populated.
+        self.hca = hca
+        self.hca_compressor: DominoHCACompressor | None = None
+        if self.hca is not None:
+            # The pooler reads the fused context feature, so its input width
+            # is the target width the context K/V projections see.
+            compressor_input = (
+                target_hidden_size
+                if target_hidden_size is not None
+                else hidden_size
+            )
+            self.hca_compressor = DominoHCACompressor(
+                compressor_input,
+                self.head_dim,
+                self.hca,
+                rms_norm_eps=rms_norm_eps,
+                prefix=f"{prefix}.hca_compressor",
+            )
+        self._cache_block_size = getattr(cache_config, "block_size", None) or 0
+        # Persistent entry pool [max_num_seqs, max_entries, hd]; allocated by
+        # the model and written in place every round so CUDA graphs baked into
+        # the dense read path keep valid pointers.
+        self._hca_pool: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def forward(
         self,
@@ -349,8 +615,164 @@ class DominoQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        if self.hca is not None and self._hca_pool is not None:
+            attn_output = self._hca_dense_attention(positions, q, k, v)
         output = self.o_proj(attn_output)
         return output
+
+    def _hca_dense_attention(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact [entries || raw band || draft block] attention for one round.
+
+        All shapes are static per graph batch: the entry pool is padded to
+        ``max_entries``, the band gather to exactly ``W`` rows (clamped and
+        over-masked when the context is shorter), and the draft block carries
+        ``n_q`` columns, so the path is CUDA-graph capturable. Per-query
+        visibility is the R2 rule shared with training: band = [t+1-W, t]
+        plus the block-bidirectional draft columns; entry j visible iff
+        ``j*hop < t+1-W`` and ``j >= nE - max_entries``.
+        """
+        spec = self.hca
+        W = spec["window"]
+        hop = spec["hop"]
+        max_entries = spec["max_entries"]
+
+        cad = get_forward_context().attn_metadata
+        query_start_loc = cad.query_start_loc
+        num_reqs = query_start_loc.numel() - 1
+        num_query = q.shape[0] // num_reqs
+        assert num_reqs * num_query == q.shape[0], (
+            "HCA dense attention requires the uniform per-request query count "
+            "of parallel drafting"
+        )
+        block_size = self._cache_block_size
+        block_table = cad.block_table_tensor
+        k_cache, v_cache = self.attn.kv_cache
+        entries_k, entries_v, pool_first, pool_stored = self._hca_pool
+        capacity = entries_k.shape[1]
+        kv_heads = self.num_kv_heads
+        head_dim = self.head_dim
+        device = positions.device
+
+        q4 = q.view(num_reqs, num_query, self.num_heads, head_dim).transpose(1, 2)
+        k_draft = (
+            k.view(num_reqs, num_query, kv_heads, head_dim)
+            .transpose(1, 2)
+            .to(entries_k.dtype)
+        )
+        v_draft = (
+            v.view(num_reqs, num_query, kv_heads, head_dim)
+            .transpose(1, 2)
+            .to(entries_k.dtype)
+        )
+
+        # Band gather: the W rows ending just below the first query position
+        # (the anchor); padded requests produce clamped, over-masked rows.
+        first_pos = positions.view(num_reqs, num_query)[:, 0]
+        band_pos = (
+            first_pos.view(-1, 1) - W + torch.arange(W, device=device).view(1, -1)
+        )
+        gather_idx = band_pos.clamp(min=0)
+        block_ids = torch.div(gather_idx, block_size, rounding_mode="floor").clamp(
+            max=block_table.shape[1] - 1
+        )
+        band_slots = gather_idx % block_size
+        band_blocks = torch.gather(block_table, 1, block_ids)
+        k_band = (
+            k_cache[band_blocks, band_slots]
+            .view(num_reqs, W, kv_heads, head_dim)
+            .transpose(1, 2)
+        )
+        v_band = (
+            v_cache[band_blocks, band_slots]
+            .view(num_reqs, W, kv_heads, head_dim)
+            .transpose(1, 2)
+        )
+
+        # [entries || band || draft]: entries broadcast over the KV heads.
+        k_all = torch.cat(
+            [
+                entries_k.unsqueeze(1).expand(-1, kv_heads, -1, -1),
+                k_band,
+                k_draft,
+            ],
+            dim=2,
+        )
+        v_all = torch.cat(
+            [
+                entries_v.unsqueeze(1).expand(-1, kv_heads, -1, -1),
+                v_band,
+                v_draft,
+            ],
+            dim=2,
+        )
+
+        t = positions.view(num_reqs, num_query, 1).to(torch.float32)
+        neg_inf = float("-inf")
+        row_ids = torch.arange(capacity, device=device).view(1, 1, -1).to(
+            torch.float32
+        )
+        # The pool holds at most the newest max_entries entries; entry index
+        # = first_index + row. Visible iff stored, and its window starts
+        # below the query's band lower bound.
+        first_idx = pool_first.view(-1, 1, 1).to(torch.float32)
+        stored = pool_stored.view(-1, 1, 1).to(torch.float32)
+        entry_pos = (first_idx + row_ids) * hop
+        visible_entries = (row_ids < stored) & (entry_pos < t + 1 - W)
+        visible_band = (band_pos.unsqueeze(1) >= t + 1 - W) & (
+            band_pos.unsqueeze(1) >= 0
+        )
+        mask = torch.where(
+            torch.cat([visible_entries, visible_band], dim=-1),
+            0.0,
+            neg_inf,
+        ).to(q4.dtype)
+        # Draft block columns are block-bidirectional (non-causal): pad the
+        # trailing num_query always-visible columns.
+        mask = F.pad(mask, (0, num_query))
+
+        attn_output = F.scaled_dot_product_attention(
+            q4,
+            k_all,
+            v_all,
+            attn_mask=mask,
+            scale=self.scaling,
+            enable_gqa=True,
+        )
+        return attn_output.transpose(1, 2).reshape(
+            num_reqs * num_query, self.num_heads * head_dim
+        )
+
+    def write_hca_pool(
+        self,
+        entries_k: torch.Tensor,
+        entries_v: torch.Tensor,
+        first_index: torch.Tensor,
+        stored: torch.Tensor,
+    ) -> None:
+        """Write this round's pooled entries into the persistent pool.
+
+        The pool buffers are allocated once by the model (max batch sized) so
+        the dense read path, which may be CUDA-graph captured, always reads
+        the same tensors; every round re-pools from the fresh context feature
+        and overwrites rows [0:B]. ``first_index``/``stored`` describe the
+        entry-index window the rows hold (the newest ``max_entries`` entries).
+        """
+        pool_k, pool_v, pool_first, pool_stored = self._hca_pool
+        num = entries_k.shape[0]
+        pool_k.zero_()
+        pool_v.zero_()
+        pool_k[:num].copy_(entries_k)
+        pool_v[:num].copy_(entries_v)
+        pool_first.zero_()
+        pool_stored.zero_()
+        pool_first[:num].copy_(first_index)
+        pool_stored[:num].copy_(stored)
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +1327,7 @@ class DominoQwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
         layer_idx: int,
         target_hidden_size: int | None,
+        hca: dict | None = None,
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -926,6 +1349,7 @@ class DominoQwen3DecoderLayer(nn.Module):
             sliding_window=sliding_window,
             causal=causal,
             num_sinks=int(_dflash_config(config).get("attn_sink", 0) or 0),
+            hca=hca,
             cache_config=cache_config,
             quant_config=quant_config,
             rope_parameters=config.rope_parameters,
@@ -1176,6 +1600,13 @@ class Qwen3DominoModel(nn.Module):
                 )
 
         current_vllm_config = get_current_vllm_config()
+        self.layer_hca_specs = resolve_domino_hca(self.config)
+        # Max concurrent requests: sizes the persistent HCA entry pools.
+        self._hca_pool_seqlen: int | None = (
+            int(current_vllm_config.scheduler_config.max_num_seqs)
+            if self.layer_hca_specs is not None
+            else None
+        )
         self.layers = nn.ModuleList(
             [
                 DominoQwen3DecoderLayer(
@@ -1187,6 +1618,11 @@ class Qwen3DominoModel(nn.Module):
                     target_hidden_size=(
                         self.target_hidden_size
                         if self.heterogeneous_kv
+                        else None
+                    ),
+                    hca=(
+                        self.layer_hca_specs[layer_idx]
+                        if self.layer_hca_specs is not None
                         else None
                     ),
                     cache_config=current_vllm_config.cache_config,
@@ -1494,6 +1930,12 @@ class Qwen3DominoModel(nn.Module):
             # Mark the fused decision as made so the precompute does not
             # re-attempt the build on every step.
             self._num_attn_layers = len(layers_attn)
+            if self.layer_hca_specs is not None:
+                raise NotImplementedError(
+                    "HCA (heavily_compressed_attention) drafts require the "
+                    "unquantized fused context-KV precompute; quantized "
+                    "context K/V projections are unsupported (v1)."
+                )
             return
 
         # KV projection weights, transposed for bmm:
@@ -1580,6 +2022,104 @@ class Qwen3DominoModel(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
         self._use_fused_context_kv = True
+        self._build_hca_pools()
+
+    def _build_hca_pools(self) -> None:
+        """Allocate the persistent per-layer HCA entry pools (once).
+
+        The dense HCA read path may be CUDA-graph captured, so every pool is
+        a fixed [max_num_seqs, max_entries, head_dim] buffer allocated once
+        and rewritten in place by each precompute pass.
+        """
+        if self.layer_hca_specs is None or self._hca_pool_seqlen is not None:
+            return
+        device = self.layers[0].self_attn.q_proj.weight.device
+        dtype = self.layers[0].self_attn.q_proj.weight.dtype
+        max_seqs = self._hca_pool_seqlen
+        for layer in self.layers:
+            attn = layer.self_attn
+            if attn.hca is None:
+                continue
+            capacity = attn.hca["max_entries"]
+            attn._hca_pool = (
+                torch.zeros(max_seqs, capacity, attn.head_dim, device=device, dtype=dtype),
+                torch.zeros(max_seqs, capacity, attn.head_dim, device=device, dtype=dtype),
+                torch.zeros(max_seqs, device=device, dtype=torch.int32),
+                torch.zeros(max_seqs, device=device, dtype=torch.int32),
+            )
+
+    @torch.inference_mode()
+    def _pool_hca_entries(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+    ) -> None:
+        """Re-pool every HCA layer's entries from the fresh context feature.
+
+        Runs once per spec-decode round inside the context-KV precompute (the
+        DFlash contract re-projects the whole context each round, so no
+        incremental compressor state is needed -- serving matches the
+        training-side one-shot pooling exactly). Each request's newest
+        ``max_entries`` entries are stored; ``first_index``/``stored`` carry
+        the entry-index window for the read path.
+        """
+        self._build_hca_pools()
+        num_ctx = context_states.shape[0]
+        starts = (context_positions == 0).nonzero(as_tuple=True)[0].tolist()
+        if not starts:
+            return
+        bounds = list(zip(starts, starts[1:] + [num_ctx]))
+        num_reqs = len(bounds)
+        D = self._num_attn_layers
+        H = self.context_hidden_size
+        for layer_idx, spec in enumerate(self.layer_hca_specs):
+            if spec is None:
+                continue
+            attn = self.layers[layer_idx].self_attn
+            compressor = attn.hca_compressor
+            capacity = spec["max_entries"]
+            hop = spec["hop"]
+            pool = attn._hca_pool
+            dtype = pool[0].dtype
+            entries_k = torch.zeros(
+                num_reqs, capacity, attn.head_dim, dtype=dtype, device=pool[0].device
+            )
+            entries_v = torch.zeros_like(entries_k)
+            first_index = torch.zeros(num_reqs, dtype=torch.int32, device=pool[0].device)
+            stored = torch.zeros(num_reqs, dtype=torch.int32, device=pool[0].device)
+            per_layer_states = (
+                context_states.view(num_ctx, D, H) if self.is_flare else None
+            )
+            for r, (begin, end) in enumerate(bounds):
+                feature = (
+                    per_layer_states[begin:end, layer_idx]
+                    if per_layer_states is not None
+                    else context_states[begin:end]
+                )
+                feature = feature.contiguous()
+                normed = torch.empty_like(feature)
+                ops.rms_norm(
+                    normed,
+                    feature,
+                    self._hidden_norm_weight,
+                    self._hidden_norm_eps,
+                )
+                pooled, emitted = compressor.pool(normed)
+                if emitted == 0:
+                    continue
+                j0 = max(0, emitted - capacity)
+                take = pooled[j0:emitted]
+                anchors = (
+                    torch.arange(j0, emitted, device=pooled.device) * hop
+                    + compressor.anchor_offset
+                )
+                k_entry = attn.rotary_emb(anchors, take.unsqueeze(1), None)[0].squeeze(1)
+                n = take.shape[0]
+                entries_k[r, :n] = k_entry.to(dtype)
+                entries_v[r, :n] = take.to(dtype)
+                first_index[r] = j0
+                stored[r] = n
+            attn.write_hca_pool(entries_k, entries_v, first_index, stored)
 
     def _project_context_kv(
         self,
@@ -1740,6 +2280,9 @@ class Qwen3DominoModel(nn.Module):
                 kv_cache,
                 slot_mapping,
             )
+
+        if self.layer_hca_specs is not None:
+            self._pool_hca_entries(context_states, context_positions)
 
     def _precompute_and_store_context_kv_per_layer(
         self,
