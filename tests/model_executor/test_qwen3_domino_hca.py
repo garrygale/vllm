@@ -175,7 +175,7 @@ def _make_hca_attention(spec):
     with patch.object(DominoQwen3Attention, "__init__", lambda self: None):
         attn = DominoQwen3Attention()
     attn.hca = spec
-    attn.num_heads = 2
+    attn.num_heads = 4
     attn.num_kv_heads = 2
     attn.head_dim = 8
     attn.scaling = 8**-0.5
@@ -201,11 +201,14 @@ class TestHcaDenseAttention:
         }
         attn = _make_hca_attention(spec)
         W = 16
-        num_reqs, num_query = 2, 3
+        # GQA shapes with num_reqs != num_kv_heads: the mask broadcast only
+        # survives both singleton axes (regression guard for the R-vs-kv
+        # broadcast bug).
+        num_reqs, num_query = 3, 3
         block_size = 4
         num_blocks = 64
 
-        first_pos = torch.tensor([40, 12])
+        first_pos = torch.tensor([40, 12, 9])
         positions = (
             first_pos.view(-1, 1) + torch.arange(num_query).view(1, -1)
         ).reshape(-1)
@@ -221,8 +224,8 @@ class TestHcaDenseAttention:
         capacity = 4
         entries_k = torch.randn(num_reqs, capacity, attn.head_dim)
         entries_v = torch.randn(num_reqs, capacity, attn.head_dim)
-        pool_first = torch.tensor([1, 0], dtype=torch.int32)
-        pool_stored = torch.tensor([4, 2], dtype=torch.int32)
+        pool_first = torch.tensor([1, 0, 0], dtype=torch.int32)
+        pool_stored = torch.tensor([4, 2, 3], dtype=torch.int32)
         attn._hca_pool = (entries_k, entries_v, pool_first, pool_stored)
         attn.attn = SimpleNamespace(kv_cache=[k_cache, v_cache])
 
@@ -275,6 +278,7 @@ class TestHcaDenseAttention:
             )
             n_e, n_b = capacity, int(first_pos[r]) - band_lo
             kv_len = n_e + n_b + num_query
+            group = attn.num_heads // attn.num_kv_heads
             for qi in range(num_query):
                 t = int(first_pos[r]) + qi
                 mask = torch.zeros(kv_len)
@@ -285,14 +289,15 @@ class TestHcaDenseAttention:
                 for e in range(int(pool_stored[r])):
                     if (int(pool_first[r]) + e) * hop < t + 1 - W:
                         mask[e] = 1
-                # heads == kv heads here, so the reference is a plain
-                # per-head softmax over the same concatenated KV.
-                scores = (k_all.float() * q_r[qi].float().unsqueeze(0).unsqueeze(1)).sum(-1)
-                scores = scores * attn.scaling + torch.where(
-                    mask == 1, 0.0, float("-inf")
-                ).unsqueeze(0)
-                probs = torch.softmax(scores, dim=-1)
-                ref = (probs.unsqueeze(-1) * v_all.float()).sum(1)
+                # Per-query-head reference with the GQA kv mapping.
+                ref = torch.empty(attn.num_heads, attn.head_dim)
+                for h in range(attn.num_heads):
+                    scores_h = (
+                        k_all[h // group].float() * q_r[qi][h].float()
+                    ).sum(-1) * attn.scaling
+                    scores_h = scores_h.masked_fill(mask == 0, float("-inf"))
+                    probs_h = torch.softmax(scores_h, dim=-1)
+                    ref[h] = (probs_h.unsqueeze(-1) * v_all[h // group].float()).sum(0)
                 got = (
                     out.view(num_reqs, num_query, attn.num_heads, attn.head_dim)[r, qi]
                     .float()

@@ -780,7 +780,12 @@ class DominoQwen3Attention(nn.Module):
         scores = torch.matmul(
             q_grouped, k_all.transpose(-1, -2).unsqueeze(2)
         )
-        scores = scores * self.scaling + mask.unsqueeze(1)
+        # [R, nq, L] -> [R, 1, 1, nq, L]: without both singleton axes the
+        # broadcast against [R, kv, group, nq, L] only works when
+        # num_reqs == 1 or num_reqs == num_kv_heads.
+        scores = scores * self.scaling + mask.reshape(
+            num_reqs, 1, 1, num_query, -1
+        )
         probs = torch.softmax(scores.float(), dim=-1).to(k_all.dtype)
         out = torch.matmul(probs, v_all.unsqueeze(2))
         return out.permute(0, 3, 1, 2, 4).reshape(
