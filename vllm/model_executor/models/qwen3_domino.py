@@ -639,7 +639,6 @@ class DominoQwen3Attention(nn.Module):
         # query K/V cache write and the runner's accounting); its output is
         # replaced by the dense path whenever the entry pool is populated.
         self.hca = hca
-        self.hca_dense_fallback = False
         # Fixed read width for the entry branch.  ``None`` means the full
         # ``max_entries`` capacity; a concrete bucket is graph-safe but must be
         # large enough for the deployment's maximum stored entry count.
@@ -683,13 +682,6 @@ class DominoQwen3Attention(nn.Module):
         ).view(k_shape)
 
         q, k = self.rotary_emb(positions, q, k)
-        if self.hca is not None:
-            # The band call may expose its softmax LSE from the backend; clear
-            # any previous layer's value before the call so a stale LSE can
-            # never be merged.
-            impl = getattr(self.attn, "impl", None)
-            if impl is not None:
-                impl._hca_last_lse = None
         attn_output = self.attn(q, k, v)
         if self.hca is not None:
             if self._hca_pool is None:
@@ -697,9 +689,7 @@ class DominoQwen3Attention(nn.Module):
                     "HCA layer is configured but its entry pool was not "
                     "allocated; refusing to silently serve band-only attention"
                 )
-            attn_output = self._hca_attention(
-                positions, q, k, v, attn_output
-            )
+            attn_output = self._hca_attention(positions, q, k, v, attn_output)
         output = self.o_proj(attn_output)
         return output
 
@@ -742,34 +732,6 @@ class DominoQwen3Attention(nn.Module):
         # the stale row rather than silently indexing out of range.
         return rows.clamp(min=0)
 
-    def _hca_band_lse(
-        self,
-        lse: torch.Tensor | None,
-        num_tokens: int,
-        num_heads: int,
-    ) -> torch.Tensor | None:
-        """Normalize the backend's band-call LSE to ``[tokens, heads]``.
-
-        FIA/FA implementations differ in whether LSE is transposed and whether
-        a leading batch axis is present.  Any layout we do not recognize
-        returns ``None``, which sends the layer to the exact dense fallback.
-        """
-
-        if lse is None or not isinstance(lse, torch.Tensor) or lse.numel() == 0:
-            return None
-        if lse.dim() == 3:
-            if lse.shape[0] == 1:
-                lse = lse[0]
-            elif lse.shape[-1] == 1:
-                lse = lse.squeeze(-1)
-        if lse.dim() != 2:
-            return None
-        if lse.shape == (num_tokens, num_heads):
-            return lse.float()
-        if lse.shape == (num_heads, num_tokens):
-            return lse.float().transpose(0, 1)
-        return None
-
     def _hca_attention(
         self,
         positions: torch.Tensor,
@@ -778,129 +740,16 @@ class DominoQwen3Attention(nn.Module):
         v: torch.Tensor,
         band_output: torch.Tensor,
     ) -> torch.Tensor:
-        """Read HCA as band output merged with an entry-only attention call.
+        """HCA read over the compressed entries, raw band, and draft block.
 
-        Falls back to the exact dense ``[entries || band || draft]`` path when
-        the backend does not expose a band LSE (e.g. CUDA FlashAttention
-        without the dedicated varlen call) or when the layout is unrecognized.
+        Dummy/profile drafts run without attention metadata (the speculator
+        passes attn_metadata=None); leave the band output in place instead of
+        dereferencing a missing block table.
         """
 
-        # Dummy/profile drafts run without attention metadata (the speculator
-        # passes attn_metadata=None); leave the band output in place instead of
-        # dereferencing a missing block table.
         if getattr(get_forward_context(), "attn_metadata", None) is None:
             return band_output
-        if self.hca_dense_fallback:
-            return self._hca_dense_attention(positions, q, k, v)
-        impl = getattr(self.attn, "impl", None)
-        lse1 = self._hca_band_lse(
-            getattr(impl, "_hca_last_lse", None) if impl is not None else None,
-            q.shape[0],
-            self.num_heads,
-        )
-        if lse1 is None:
-            logger.info_once(
-                "HCA: band LSE unavailable; using the dense fallback read"
-            )
-            return self._hca_dense_attention(positions, q, k, v)
-
-        entry = self._hca_entry_attention(positions, q)
-        if entry is None:
-            logger.info_once(
-                "HCA: entry attention metadata mismatch; using the dense fallback"
-            )
-            return self._hca_dense_attention(positions, q, k, v)
-        logger.info_once(
-            "HCA: merging band and entry attention via softmax LSE"
-        )
-        o2, lse2 = entry
-        o1 = band_output.float().reshape(o2.shape)
-        lse = torch.logaddexp(lse1, lse2)
-        finite = torch.isfinite(lse)
-        safe = torch.where(finite, lse, torch.zeros_like(lse))
-        w1 = torch.where(finite, torch.exp(lse1 - safe), torch.zeros_like(lse))
-        w2 = torch.where(finite, torch.exp(lse2 - safe), torch.zeros_like(lse))
-        out = o1 * w1.unsqueeze(-1) + o2 * w2.unsqueeze(-1)
-        return out.to(band_output.dtype).reshape(band_output.shape)
-
-    def _hca_entry_attention(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Attention over the compressed entries only.
-
-        Returns ``(output [tokens, heads, hd], lse [tokens, heads])``, or
-        ``None`` when the batch metadata does not line up.
-        """
-
-        query_start_loc, block_table = self._hca_metadata()
-        num_reqs = query_start_loc.numel() - 1
-        num_query = q.shape[0] // num_reqs
-        if num_reqs <= 0 or num_reqs * num_query != q.shape[0]:
-            return None
-        entries_k, entries_v, pool_first, pool_stored = self._hca_pool
-        pool_rows = self._hca_pool_indices(block_table, num_reqs)
-        if pool_rows is not None:
-            entries_k = entries_k[pool_rows]
-            entries_v = entries_v[pool_rows]
-            pool_first = pool_first[pool_rows]
-            pool_stored = pool_stored[pool_rows]
-
-        spec = self.hca
-        hop = spec["hop"]
-        W = spec["window"]
-        capacity = entries_k.shape[1]
-        bucket = getattr(self, "hca_entry_bucket", None)
-        if bucket is not None and bucket < capacity:
-            capacity = bucket
-            entries_k = entries_k[:, :capacity]
-            entries_v = entries_v[:, :capacity]
-            pool_stored = pool_stored.clamp(max=capacity)
-        kv_heads = self.num_kv_heads
-        head_dim = self.head_dim
-        group = self.num_heads // kv_heads
-        device = positions.device
-
-        q4 = q.view(
-            num_reqs, num_query, self.num_heads, head_dim
-        ).transpose(1, 2).to(entries_k.dtype)
-        q_grouped = q4.view(
-            num_reqs, kv_heads, group, num_query, head_dim
-        )
-        k_entries = entries_k.view(num_reqs, 1, 1, capacity, head_dim)
-        v_entries = entries_v.view(num_reqs, 1, 1, capacity, head_dim)
-        scores = (
-            torch.matmul(q_grouped, k_entries.transpose(-1, -2))
-            * self.scaling
-        )
-
-        t = positions.view(num_reqs, num_query).unsqueeze(-1)
-        row_ids = torch.arange(capacity, device=device).view(1, 1, -1)
-        first = pool_first.view(-1, 1, 1)
-        stored = pool_stored.view(-1, 1, 1)
-        entry_pos = (first + row_ids) * hop
-        visible = (row_ids < stored) & (entry_pos < t + 1 - W)
-        scores = scores.masked_fill(
-            ~visible.unsqueeze(1).unsqueeze(1), float("-inf")
-        )
-        any_visible = visible.any(dim=-1)
-        lse = torch.logsumexp(scores.float(), dim=-1)
-        lse = torch.where(
-            any_visible.unsqueeze(1).unsqueeze(1),
-            lse,
-            torch.full_like(lse, float("-inf")),
-        )
-        probs = torch.softmax(scores.float(), dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0).to(entries_k.dtype)
-        out = torch.matmul(probs, v_entries)
-        out = out.permute(0, 3, 1, 2, 4).reshape(
-            num_reqs * num_query, self.num_heads, head_dim
-        )
-        lse = lse.permute(0, 3, 1, 2).reshape(
-            num_reqs * num_query, self.num_heads
-        )
-        return out, lse
+        return self._hca_dense_attention(positions, q, k, v)
 
     def _hca_dense_attention(
         self,
@@ -909,15 +758,17 @@ class DominoQwen3Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
-        """Exact [entries || raw band || draft block] attention for one round.
+        """Exact [entries || raw band || draft block] attention, segmented.
 
-        All shapes are static per graph batch: the entry pool is padded to
-        ``max_entries``, the band gather to exactly ``W`` rows (clamped and
-        over-masked when the context is shorter), and the draft block carries
-        ``n_q`` columns, so the path is CUDA-graph capturable. Per-query
-        visibility is the R2 rule shared with training: band = [t+1-W, t]
-        plus the block-bidirectional draft columns; entry j visible iff
-        ``j*hop < t+1-W`` and ``j >= nE - max_entries``.
+        Each segment runs as its own grouped GQA attention with its R2
+        visibility mask, and the three partial results merge through per-row
+        softmax LSE -- algebraically one softmax over the concatenation. No
+        ``torch.cat`` appears anywhere: aclnnCat rejects the concatenated KV
+        form on NPU even with normalized dtypes/contiguity, and the backend
+        band-LSE is only a placeholder under Ascend graph capture, so the
+        earlier two-call-merge + dense-fallback pair collapses into this
+        single pure matmul/softmax formulation. Shapes stay static per graph
+        batch (entries padded to the pool capacity, band to exactly W rows).
         """
         spec = self.hca
         W = spec["window"]
@@ -944,10 +795,9 @@ class DominoQwen3Attention(nn.Module):
         else:
             k_cache, v_cache = kv_caches
             block_size = k_cache.shape[1]
-        entries_k, entries_v, pool_first, pool_stored = self._hca_pool
         # Pool rows are keyed by the request's first physical block so a
-        # request keeps its state across batch reordering.  Gather the current
-        # batch's rows before the dense read.
+        # request keeps its state across batch reordering.
+        entries_k, entries_v, pool_first, pool_stored = self._hca_pool
         pool_rows = self._hca_pool_indices(block_table, num_reqs)
         if pool_rows is not None:
             entries_k = entries_k[pool_rows]
@@ -963,18 +813,24 @@ class DominoQwen3Attention(nn.Module):
             pool_stored = pool_stored.clamp(max=capacity)
         kv_heads = self.num_kv_heads
         head_dim = self.head_dim
+        group = self.num_heads // kv_heads
         device = positions.device
 
-        q4 = q.view(num_reqs, num_query, self.num_heads, head_dim).transpose(1, 2)
+        q4 = (
+            q.view(num_reqs, num_query, self.num_heads, head_dim)
+            .transpose(1, 2)
+            .float()
+        )
+        q_grouped = q4.reshape(num_reqs, kv_heads, group, num_query, head_dim)
         k_draft = (
             k.view(num_reqs, num_query, kv_heads, head_dim)
             .transpose(1, 2)
-            .to(entries_k.dtype)
+            .float()
         )
         v_draft = (
             v.view(num_reqs, num_query, kv_heads, head_dim)
             .transpose(1, 2)
-            .to(entries_k.dtype)
+            .float()
         )
 
         # Band gather: the W rows ending just below the first query position
@@ -993,85 +849,69 @@ class DominoQwen3Attention(nn.Module):
             k_cache[band_blocks, band_slots]
             .reshape(num_reqs, W, kv_heads, head_dim)
             .transpose(1, 2)
+            .float()
         )
         v_band = (
             v_cache[band_blocks, band_slots]
             .reshape(num_reqs, W, kv_heads, head_dim)
             .transpose(1, 2)
+            .float()
         )
 
-        # [entries || band || draft]: entries broadcast over the KV heads.
-        # ACLNN's cat rejects non-contiguous/zero-stride inputs and requires a
-        # single dtype, so normalize all three views before concatenating.
-        k_band = k_band.to(entries_k.dtype).contiguous()
-        v_band = v_band.to(entries_v.dtype).contiguous()
-        k_all = torch.cat(
-            [
-                entries_k.unsqueeze(1)
-                .expand(-1, kv_heads, -1, -1)
-                .contiguous(),
-                k_band,
-                k_draft.contiguous(),
-            ],
-            dim=2,
-        )
-        v_all = torch.cat(
-            [
-                entries_v.unsqueeze(1)
-                .expand(-1, kv_heads, -1, -1)
-                .contiguous(),
-                v_band,
-                v_draft.contiguous(),
-            ],
-            dim=2,
-        )
-        q4 = q4.to(k_all.dtype)
-
+        # R2 visibility: entries by window start below the band; the band by
+        # position inside [t+1-W, t]; the draft block block-bidirectional.
         t = positions.view(num_reqs, num_query, 1).to(torch.float32)
-        neg_inf = float("-inf")
         row_ids = torch.arange(capacity, device=device).view(1, 1, -1).to(
             torch.float32
         )
-        # The pool holds at most the newest max_entries entries; entry index
-        # = first_index + row. Visible iff stored, and its window starts
-        # below the query's band lower bound.
         first_idx = pool_first.view(-1, 1, 1).to(torch.float32)
         stored = pool_stored.view(-1, 1, 1).to(torch.float32)
-        entry_pos = (first_idx + row_ids) * hop
-        visible_entries = (row_ids < stored) & (entry_pos < t + 1 - W)
+        visible_entries = (row_ids < stored) & (
+            (first_idx + row_ids) * hop < t + 1 - W
+        )
         visible_band = (band_pos.unsqueeze(1) >= t + 1 - W) & (
             band_pos.unsqueeze(1) >= 0
         )
-        # ACLNN's bool cat is also fragile; materialize float masks and use a
-        # float cat with contiguous inputs, then cast once.
-        entry_mask = torch.where(
-            visible_entries, 0.0, neg_inf
-        ).contiguous()
-        band_mask = torch.where(visible_band, 0.0, neg_inf).contiguous()
-        mask = torch.cat([entry_mask, band_mask], dim=-1).to(q4.dtype)
-        # Draft block columns are block-bidirectional (non-causal): pad the
-        # trailing num_query always-visible columns.
-        mask = F.pad(mask, (0, num_query))
-
-        # Grouped matmul over GQA (no sdpa enable_gqa: torch_npu support is
-        # unverified); scores/mask are small at draft sizes.
-        group = self.num_heads // kv_heads
-        q_grouped = q4.reshape(num_reqs, kv_heads, group, num_query, head_dim)
-        scores = torch.matmul(
-            q_grouped, k_all.transpose(-1, -2).unsqueeze(2)
+        visible_draft = torch.ones(
+            num_reqs, num_query, num_query, dtype=torch.bool, device=device
         )
-        # [R, nq, L] -> [R, 1, 1, nq, L]: without both singleton axes the
-        # broadcast against [R, kv, group, nq, L] only works when
-        # num_reqs == 1 or num_reqs == num_kv_heads.
-        scores = scores * self.scaling + mask.reshape(
-            num_reqs, 1, 1, num_query, -1
-        )
-        probs = torch.softmax(scores.float(), dim=-1).to(k_all.dtype)
-        out = torch.matmul(probs, v_all.unsqueeze(2))
-        return out.permute(0, 3, 1, 2, 4).reshape(
-            num_reqs * num_query, self.num_heads * head_dim
-        ).to(q.dtype)
 
+        def segment(k_seg, v_seg, visible):
+            # k_seg [R, kv, N, hd] (entries pass a [R, 1, N, hd] shared
+            # head); returns partial output [R, kv, group, nq, hd] and LSE
+            # [R, kv, group, nq], fp32 throughout.
+            scores = torch.matmul(
+                q_grouped, k_seg.transpose(-1, -2).unsqueeze(2)
+            )
+            scores = scores * self.scaling + torch.where(
+                visible, 0.0, float("-inf")
+            ).reshape(num_reqs, 1, 1, num_query, -1)
+            lse = torch.logsumexp(scores, dim=-1)
+            out = torch.matmul(torch.softmax(scores, dim=-1), v_seg.unsqueeze(2))
+            return out, lse
+
+        out_e, lse_e = segment(
+            entries_k.unsqueeze(1).float(),
+            entries_v.unsqueeze(1).float(),
+            visible_entries,
+        )
+        out_b, lse_b = segment(k_band, v_band, visible_band)
+        out_d, lse_d = segment(k_draft, v_draft, visible_draft)
+
+        # LSE merge == one softmax over the concatenation; the draft segment
+        # is always fully visible, so the merged LSE stays finite and rows
+        # with no visible entries/band contribute exp(-inf - lse) = 0.
+        lse = torch.logaddexp(torch.logaddexp(lse_e, lse_b), lse_d)
+        out = (
+            out_e * torch.exp(lse_e - lse).unsqueeze(-1)
+            + out_b * torch.exp(lse_b - lse).unsqueeze(-1)
+            + out_d * torch.exp(lse_d - lse).unsqueeze(-1)
+        )
+        return (
+            out.permute(0, 3, 1, 2, 4)
+            .to(entries_k.dtype)
+            .reshape(num_reqs * num_query, self.num_heads * head_dim)
+        )
 
 # ---------------------------------------------------------------------------
 # Shared gate/up projections (``dflash_config.ffn_sharing``)
@@ -1940,14 +1780,7 @@ class Qwen3DominoModel(nn.Module):
                     "all draft layers must share dflash_config.attn_sink; "
                     f"model={self.num_sinks}, layers={sorted(layer_sinks)}"
                 )
-        # Serving-only escape hatch: keep the exact dense [entries||band||draft]
-        # read path if the platform's band LSE is unavailable or suspect.
-        self.hca_dense_fallback = bool(
-            _dflash_config(self.config).get("hca_dense_fallback", False)
-        )
         if self.layer_hca_specs is not None:
-            for layer in self.layers:
-                layer.self_attn.hca_dense_fallback = self.hca_dense_fallback
             bucket = _dflash_config(self.config).get("hca_entry_bucket")
             if bucket is not None:
                 if (
@@ -2369,7 +2202,7 @@ class Qwen3DominoModel(nn.Module):
             if norm_weight is not None and norm_weight.is_floating_point()
             else self.layers[0].self_attn.q_proj.weight.dtype
         )
-        if not dtype.is_floating_point:
+        if not dtype.is_floating_point():
             dtype = torch.bfloat16
         max_seqs = self._hca_pool_seqlen
         self._hca_pools_built = True
