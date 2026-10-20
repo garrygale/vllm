@@ -2241,7 +2241,6 @@ class Qwen3DominoModel(nn.Module):
         self._hca_row2block = torch.full(
             (max_seqs,), -1, device=device, dtype=torch.int64
         )
-        self._hca_block2row: torch.Tensor | None = None
         self._hca_row_cursor = 0
 
         for layer in self.layers:
