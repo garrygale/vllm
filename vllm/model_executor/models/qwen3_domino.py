@@ -60,7 +60,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
-from vllm.v1.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
