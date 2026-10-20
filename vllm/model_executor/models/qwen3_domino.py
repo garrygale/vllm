@@ -785,6 +785,11 @@ class DominoQwen3Attention(nn.Module):
         without the dedicated varlen call) or when the layout is unrecognized.
         """
 
+        # Dummy/profile drafts run without attention metadata (the speculator
+        # passes attn_metadata=None); leave the band output in place instead of
+        # dereferencing a missing block table.
+        if getattr(get_forward_context(), "attn_metadata", None) is None:
+            return band_output
         if self.hca_dense_fallback:
             return self._hca_dense_attention(positions, q, k, v)
         impl = getattr(self.attn, "impl", None)
