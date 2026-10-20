@@ -466,10 +466,20 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        # HCA's incremental compressor needs the paged block table to map this
+        # round's tokens to a request row.  The Domino HCA layers share the
+        # full-attention draft cache group, so the first group is the relevant
+        # one for the (single-group) HCA path.
+        context_block_table = None
+        if not dummy_run:
+            context_block_table = self.block_tables.input_block_tables[
+                self.draft_kv_cache_group_ids[0]
+            ][:num_reqs]
         self.model.precompute_and_store_context_kv(
             self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
             context_slots,
+            context_block_table,
         )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
