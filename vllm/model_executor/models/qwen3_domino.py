@@ -2191,6 +2191,29 @@ class Qwen3DominoModel(nn.Module):
 
         if self.layer_hca_specs is None or self._hca_pool_seqlen is None:
             return
+        # Allocate the block->row map up front when the paged cache is
+        # already attached (it is by the first dummy precompute): ACL graph
+        # capture precedes any real request, and the captured pool-row gather
+        # must find a persistent tensor from the very first forward. Sized to
+        # the full block count, the lazy growth in _hca_row_for_block never
+        # replaces the tensor a captured graph references. This runs before
+        # the pools-built early return: the first build may happen at weight
+        # load, before any cache exists.
+        first_hca = next(
+            layer.self_attn for layer in self.layers if layer.self_attn.hca is not None
+        )
+        if self._hca_block2row is None and first_hca.attn.kv_cache is not None:
+            num_blocks = _hca_cache_num_blocks(first_hca.attn.kv_cache)
+            if num_blocks > 0:
+                self._hca_block2row = torch.full(
+                    (num_blocks,),
+                    -1,
+                    device=first_hca.attn.kv_cache[0].device
+                    if not isinstance(first_hca.attn.kv_cache, torch.Tensor)
+                    else first_hca.attn.kv_cache.device,
+                    dtype=torch.int64,
+                )
+                self._sync_hca_block_map()
         if getattr(self, "_hca_pools_built", False):
             return
         device = self.layers[0].self_attn.q_proj.weight.device
@@ -2245,25 +2268,7 @@ class Qwen3DominoModel(nn.Module):
                 int(spec["hop"]),
                 device=device,
             )
-        # Allocate the block->row map up front when the paged cache is
-        # already attached (it is by the first dummy precompute): ACL graph
-        # capture precedes any real request, and the captured pool-row gather
-        # must find a persistent tensor from the very first forward. Sizing
-        # it to the full block count also means the lazy growth in
-        # _hca_row_for_block never replaces the tensor a graph baked in.
-        first_hca = next(
-            layer.self_attn for layer in self.layers if layer.self_attn.hca is not None
-        )
-        if self._hca_block2row is None and first_hca.attn.kv_cache is not None:
-            num_blocks = _hca_cache_num_blocks(first_hca.attn.kv_cache)
-            if num_blocks > 0:
-                self._hca_block2row = torch.full(
-                    (num_blocks,),
-                    -1,
-                    device=device,
-                    dtype=torch.int64,
-                )
-                self._sync_hca_block_map()
+            attn._hca_block2row = self._hca_block2row
 
     def _sync_hca_block_map(self) -> None:
         """Share the block→row map with the dense read path."""
