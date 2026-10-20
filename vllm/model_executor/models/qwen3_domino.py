@@ -724,7 +724,11 @@ class DominoQwen3Attention(nn.Module):
 
         block2row = getattr(self, "_hca_block2row", None)
         if block2row is None:
-            return None
+            # Only reachable if no precompute (not even a dummy one) ran
+            # before this forward. Read row 0: its stored count starts at 0,
+            # so the entry segment is fully masked and the layer degrades to
+            # band + draft attention instead of shape-mismatching the pool.
+            return torch.zeros(num_reqs, dtype=torch.long, device=block_table.device)
         first_blocks = block_table[:num_reqs, 0].to(torch.long)
         rows = block2row[first_blocks]
         # An unassigned row here would be a precompute/ordering bug; clamping
@@ -2241,7 +2245,25 @@ class Qwen3DominoModel(nn.Module):
                 int(spec["hop"]),
                 device=device,
             )
-            attn._hca_block2row = None
+        # Allocate the block->row map up front when the paged cache is
+        # already attached (it is by the first dummy precompute): ACL graph
+        # capture precedes any real request, and the captured pool-row gather
+        # must find a persistent tensor from the very first forward. Sizing
+        # it to the full block count also means the lazy growth in
+        # _hca_row_for_block never replaces the tensor a graph baked in.
+        first_hca = next(
+            layer.self_attn for layer in self.layers if layer.self_attn.hca is not None
+        )
+        if self._hca_block2row is None and first_hca.attn.kv_cache is not None:
+            num_blocks = _hca_cache_num_blocks(first_hca.attn.kv_cache)
+            if num_blocks > 0:
+                self._hca_block2row = torch.full(
+                    (num_blocks,),
+                    -1,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                self._sync_hca_block_map()
 
     def _sync_hca_block_map(self) -> None:
         """Share the block→row map with the dense read path."""
