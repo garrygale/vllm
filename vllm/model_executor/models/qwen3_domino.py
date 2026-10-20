@@ -864,7 +864,7 @@ class DominoQwen3Attention(nn.Module):
 
         q4 = q.view(
             num_reqs, num_query, self.num_heads, head_dim
-        ).transpose(1, 2)
+        ).transpose(1, 2).to(entries_k.dtype)
         q_grouped = q4.view(
             num_reqs, kv_heads, group, num_query, head_dim
         )
@@ -1001,22 +1001,31 @@ class DominoQwen3Attention(nn.Module):
         )
 
         # [entries || band || draft]: entries broadcast over the KV heads.
+        # ACLNN's cat rejects non-contiguous/zero-stride inputs and requires a
+        # single dtype, so normalize all three views before concatenating.
+        k_band = k_band.to(entries_k.dtype).contiguous()
+        v_band = v_band.to(entries_v.dtype).contiguous()
         k_all = torch.cat(
             [
-                entries_k.unsqueeze(1).expand(-1, kv_heads, -1, -1),
+                entries_k.unsqueeze(1)
+                .expand(-1, kv_heads, -1, -1)
+                .contiguous(),
                 k_band,
-                k_draft,
+                k_draft.contiguous(),
             ],
             dim=2,
         )
         v_all = torch.cat(
             [
-                entries_v.unsqueeze(1).expand(-1, kv_heads, -1, -1),
+                entries_v.unsqueeze(1)
+                .expand(-1, kv_heads, -1, -1)
+                .contiguous(),
                 v_band,
-                v_draft,
+                v_draft.contiguous(),
             ],
             dim=2,
         )
+        q4 = q4.to(k_all.dtype)
 
         t = positions.view(num_reqs, num_query, 1).to(torch.float32)
         neg_inf = float("-inf")
@@ -1033,11 +1042,13 @@ class DominoQwen3Attention(nn.Module):
         visible_band = (band_pos.unsqueeze(1) >= t + 1 - W) & (
             band_pos.unsqueeze(1) >= 0
         )
-        mask = torch.where(
-            torch.cat([visible_entries, visible_band], dim=-1),
-            0.0,
-            neg_inf,
-        ).to(q4.dtype)
+        # ACLNN's bool cat is also fragile; materialize float masks and use a
+        # float cat with contiguous inputs, then cast once.
+        entry_mask = torch.where(
+            visible_entries, 0.0, neg_inf
+        ).contiguous()
+        band_mask = torch.where(visible_band, 0.0, neg_inf).contiguous()
+        mask = torch.cat([entry_mask, band_mask], dim=-1).to(q4.dtype)
         # Draft block columns are block-bidirectional (non-causal): pad the
         # trailing num_query always-visible columns.
         mask = F.pad(mask, (0, num_query))
@@ -1059,7 +1070,7 @@ class DominoQwen3Attention(nn.Module):
         out = torch.matmul(probs, v_all.unsqueeze(2))
         return out.permute(0, 3, 1, 2, 4).reshape(
             num_reqs * num_query, self.num_heads * head_dim
-        )
+        ).to(q.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -2346,7 +2357,20 @@ class Qwen3DominoModel(nn.Module):
         if getattr(self, "_hca_pools_built", False):
             return
         device = self.layers[0].self_attn.q_proj.weight.device
-        dtype = self.layers[0].self_attn.q_proj.weight.dtype
+        # Never inherit a quantized (integer/packed) storage dtype from q_proj:
+        # the entry pool must stay in the floating activation dtype it is
+        # concatenated with in the dense read.
+        q_norm = getattr(self.layers[0].self_attn, "q_norm", None)
+        norm_weight = getattr(q_norm, "weight", None)
+        if norm_weight is None or not norm_weight.is_floating_point():
+            norm_weight = getattr(getattr(self, "norm", None), "weight", None)
+        dtype = (
+            norm_weight.dtype
+            if norm_weight is not None and norm_weight.is_floating_point()
+            else self.layers[0].self_attn.q_proj.weight.dtype
+        )
+        if not dtype.is_floating_point():
+            dtype = torch.bfloat16
         max_seqs = self._hca_pool_seqlen
         self._hca_pools_built = True
         self._hca_pos_last = torch.full(
