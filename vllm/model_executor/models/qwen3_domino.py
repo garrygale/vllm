@@ -1749,6 +1749,12 @@ class Qwen3DominoModel(nn.Module):
             if self.layer_hca_specs is not None
             else None
         )
+        # HCA request-row bookkeeping; the pools/states themselves are built
+        # lazily by _build_hca_pools once weights are loaded.
+        self._hca_block2row: torch.Tensor | None = None
+        self._hca_row2block: torch.Tensor | None = None
+        self._hca_pos_last: torch.Tensor | None = None
+        self._hca_row_cursor = 0
         self.layers = nn.ModuleList(
             [
                 DominoQwen3DecoderLayer(
