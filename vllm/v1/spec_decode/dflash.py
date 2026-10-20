@@ -130,6 +130,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # Store for build_model_inputs_first_pass to use
         self._dflash_num_context = num_context
+        # The HCA incremental compressor maps this round's tokens to request
+        # rows through the paged block table.
+        self._dflash_context_block_table = cad.block_table_tensor[
+            : cad.num_reqs
+        ]
 
         # We don't need to copy into a buffer here since the context preprocessing
         # does not run in a CUDA graph
@@ -290,6 +295,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
             self._context_positions_buffer[:num_context],
             self._context_slot_mapping_buffer[:num_context],
+            getattr(self, "_dflash_context_block_table", None),
         )
         return (
             dict(
