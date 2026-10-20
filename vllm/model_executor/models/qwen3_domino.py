@@ -85,6 +85,20 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+class _DominoWeightsMapper(WeightsMapper):
+    """WeightsMapper that leaves HCA compressor parameters alone.
+
+    The generic ``.gate_proj -> .gate_up_proj`` MLP mapping also matches the
+    compressor's ``hca_compressor.gate_proj``; that module has no fused
+    ``gate_up_proj`` and its checkpoint name already matches the vLLM module.
+    """
+
+    def _map_name_with_shard(self, key: str):
+        if ".hca_compressor." in key:
+            return key, None
+        return super()._map_name_with_shard(key)
+
+
 def _dflash_config(config: Qwen3Config) -> dict:
     return getattr(config, "dflash_config", None) or {}
 
@@ -677,7 +691,12 @@ class DominoQwen3Attention(nn.Module):
             if impl is not None:
                 impl._hca_last_lse = None
         attn_output = self.attn(q, k, v)
-        if self.hca is not None and self._hca_pool is not None:
+        if self.hca is not None:
+            if self._hca_pool is None:
+                raise RuntimeError(
+                    "HCA layer is configured but its entry pool was not "
+                    "allocated; refusing to silently serve band-only attention"
+                )
             attn_output = self._hca_attention(
                 positions, q, k, v, attn_output
             )
@@ -3050,7 +3069,7 @@ class Qwen3DominoModel(nn.Module):
                 slot_mapping,
             )
 
-    hf_to_vllm_mapper = WeightsMapper(
+    hf_to_vllm_mapper = _DominoWeightsMapper(
         orig_to_new_stacked={
             ".gate_proj": (".gate_up_proj", 0),
             ".up_proj": (".gate_up_proj", 1),

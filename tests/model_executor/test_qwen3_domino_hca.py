@@ -16,6 +16,7 @@ import torch
 from vllm.model_executor.models.qwen3_domino import (
     DominoHCACompressor,
     DominoQwen3Attention,
+    _DominoWeightsMapper,
     _domino_layer_attention,
     _hat_window_kernel,
     resolve_domino_hca,
@@ -309,3 +310,22 @@ class TestHcaDenseAttention:
 
     def test_hat(self):
         self._run("hat", hop=8)
+
+
+def test_hca_compressor_is_not_mlp_stacked_mapped():
+    """The generic MLP gate/up mapping must not touch the compressor."""
+
+    mapper = _DominoWeightsMapper(
+        orig_to_new_stacked={
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        }
+    )
+    hca_gate = "layers.0.self_attn.hca_compressor.gate_proj.weight"
+    hca_up = "layers.0.self_attn.hca_compressor.gate_up_proj.weight"
+    mlp_gate = "layers.0.mlp.gate_proj.weight"
+    mlp_up = "layers.0.mlp.up_proj.weight"
+    assert mapper._map_name(hca_gate) == hca_gate
+    assert mapper._map_name(hca_up) == hca_up
+    assert mapper._map_name(mlp_gate) == "layers.0.mlp.gate_up_proj.weight"
+    assert mapper._map_name(mlp_up) == "layers.0.mlp.gate_up_proj.weight"
