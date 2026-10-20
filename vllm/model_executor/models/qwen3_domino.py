@@ -363,15 +363,20 @@ class DominoHCACompressor(nn.Module):
             return feature.new_zeros(0, self.kv_proj.output_size), 0
         kv = self.kv_proj(feature)[0]
         gate = self.gate_proj(feature)[0]
-        # [S, hd, win] with hop stride; slice to the closed windows only.
-        kv_windows = kv.unfold(0, self.win, self.hop)[:capacity]
-        gate_windows = gate.unfold(0, self.win, self.hop)[:capacity]
+        # Index-gathered hop-strided windows, [capacity, win, hd]: same values
+        # as tensor unfold, kept in the serving path so both sides share one
+        # formulation (unfold backward has no NPU kernel).
+        window_idx = (
+            torch.arange(capacity, device=feature.device) * self.hop
+        ).unsqueeze(1) + torch.arange(self.win, device=feature.device)
+        kv_windows = kv[window_idx]
+        gate_windows = gate[window_idx]
         weights = torch.softmax(
-            gate_windows + self.position_bias.t().unsqueeze(0),
-            dim=-1,
+            gate_windows + self.position_bias,
+            dim=1,
             dtype=torch.float32,
         ).to(kv_windows.dtype)
-        pooled = self.norm((kv_windows * weights).sum(dim=-1))
+        pooled = self.norm((kv_windows * weights).sum(dim=1))
         return pooled, capacity
 
     def anchor_positions(self, num_entries: int, device) -> torch.Tensor:
