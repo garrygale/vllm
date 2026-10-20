@@ -2369,7 +2369,7 @@ class Qwen3DominoModel(nn.Module):
             if norm_weight is not None and norm_weight.is_floating_point()
             else self.layers[0].self_attn.q_proj.weight.dtype
         )
-        if not dtype.is_floating_point():
+        if not dtype.is_floating_point:
             dtype = torch.bfloat16
         max_seqs = self._hca_pool_seqlen
         self._hca_pools_built = True
