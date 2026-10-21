@@ -2429,15 +2429,9 @@ class Qwen3DominoModel(nn.Module):
             )[indices, layer_idx]
         else:
             feature = context_states[indices]
-        feature = feature.contiguous()
-        normed = torch.empty_like(feature)
-        ops.rms_norm(
-            normed,
-            feature,
-            self._hidden_norm_weight,
-            self._hidden_norm_eps,
-        )
-        return normed
+        # The RMSNorm module dispatches per platform (ops.rms_norm binds the
+        # CUDA _C extension and does not exist under vLLM-Ascend).
+        return self.hidden_norm(feature.contiguous())
 
     def _hca_entry_kv(
         self,
