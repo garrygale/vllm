@@ -2515,12 +2515,22 @@ class Qwen3DominoModel(nn.Module):
         state.reset_row(row)
         kv = compressor.kv_proj(normed)[0]
         gate = compressor.gate_proj(normed)[0]
+        # An open window never extends past start + win, and the feature rows
+        # must cover [0, context_len); clamp both so a metadata/context-length
+        # disagreement cannot index out of bounds, and surface it once.
+        token_bound = min(context_len, normed.shape[0])
+        if token_bound != context_len:
+            logger.warning_once(
+                "HCA prefill seeding: context_len %d != feature rows %d; "
+                "clamping to %d",
+                context_len, normed.shape[0], token_bound,
+            )
         for window in _hca_open_windows(context_len, win, hop):
             start = window * hop
-            if start < 0 or start >= context_len:
+            if start < 0 or start >= token_bound:
                 continue
             phase = window % coff
-            for pos in range(start, context_len):
+            for pos in range(start, min(token_bound, start + win)):
                 pooled_step = state.update(
                     row,
                     phase,
