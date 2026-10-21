@@ -2484,6 +2484,26 @@ class Qwen3DominoModel(nn.Module):
         row: int,
     ) -> None:
         """One-shot pool the closed windows, then seed the open tail state."""
+        try:
+            self._hca_prefill_group_impl(context_len, normed, attn, row)
+        except IndexError as error:
+            state_rows = attn._hca_state.num_rows
+            logger.error(
+                "HCA prefill IndexError: %s | row=%d state_rows=%d pool_rows=%d "
+                "context_len=%d feature_rows=%d win=%d hop=%d coff=%d",
+                error, row, state_rows, attn._hca_pool[0].shape[0],
+                context_len, normed.shape[0], attn.hca["win"], attn.hca["hop"],
+                attn.hca["coff"],
+            )
+            raise
+
+    def _hca_prefill_group_impl(
+        self,
+        context_len: int,
+        normed: torch.Tensor,
+        attn: nn.Module,
+        row: int,
+    ) -> None:
 
         compressor = attn.hca_compressor
         spec = attn.hca
