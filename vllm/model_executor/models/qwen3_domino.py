@@ -330,6 +330,26 @@ def resolve_domino_hca(config: Qwen3Config) -> Optional[tuple]:
     return tuple(specs)
 
 
+def _hca_anchor_rope(rotary_emb, pooled: torch.Tensor, anchors: torch.Tensor):
+    """Rotate pooled entries at their anchor positions, straight from the
+    cos/sin cache (neox halves), bypassing the platform rope wrapper.
+
+    The Ascend wrapper assumes the attention call's global cos/sin state and
+    token layout, which out-of-band compressor calls violate; this spelling
+    is also exactly the training-side apply_rotary_pos_emb formula.
+    """
+
+    if not rotary_emb.is_neox_style:
+        raise NotImplementedError(
+            "HCA anchor rope expects the neox convention (qwen3 drafts)"
+        )
+    cache = rotary_emb.cos_sin_cache
+    cs = cache[anchors].to(pooled.dtype)
+    cos, sin = cs.chunk(2, dim=-1)
+    x1, x2 = pooled.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
 def _hca_open_windows(context_len: int, win: int, hop: int) -> range:
     """Windows that are still open after a context of ``context_len`` tokens.
 
@@ -2450,12 +2470,11 @@ class Qwen3DominoModel(nn.Module):
         entry = pooled.to(pool_dtype)
         entry = compressor.norm(entry.unsqueeze(0))[0]
         anchor = window_anchor(window, hop, coff, win)
-        anchor_t = torch.tensor(
-            [anchor], device=entry.device, dtype=torch.long
-        )
-        k_query = entry.view(1, 1, -1)
-        k_entry = attn.rotary_emb(anchor_t, k_query, k_query.clone())[0]
-        return k_entry[0], entry
+        k_entry = _hca_anchor_rope(
+            attn.rotary_emb, entry.unsqueeze(0),
+            torch.tensor([anchor], device=entry.device, dtype=torch.long),
+        )[0]
+        return k_entry, entry
 
     def _hca_prefill_group(
         self,
@@ -2478,10 +2497,7 @@ class Qwen3DominoModel(nn.Module):
             anchors = torch.arange(
                 emitted, device=pooled.device
             ) * hop + compressor.anchor_offset
-            k_query = pooled.unsqueeze(1)
-            k_entry = attn.rotary_emb(
-                anchors, k_query, k_query.clone()
-            )[0].squeeze(1)
+            k_entry = _hca_anchor_rope(attn.rotary_emb, pooled, anchors)
             write_prefill_pool(
                 pool[0],
                 pool[1],
