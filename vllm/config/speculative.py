@@ -66,6 +66,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+DominoModelTypes = Literal["domino"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -79,6 +80,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    DominoModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -617,6 +619,7 @@ class SpeculativeConfig:
             "extract_hidden_states",
             "dflash",
             "dspark",
+            "domino",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -1304,7 +1307,7 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark", "domino"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1315,6 +1318,19 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
+                elif (
+                    (
+                        getattr(
+                            self.draft_model_config.hf_config,
+                            "dflash_config",
+                            None,
+                        )
+                        or {}
+                    ).get("projector_type")
+                    == "domino"
+                    or "domino" in self.draft_model_config.model.lower()
+                ):
+                    self.method = "domino"
                 elif (
                     "dflash" in self.draft_model_config.model.lower()
                     or "MuseGlimmerAssistantModel"
@@ -1457,8 +1473,18 @@ class SpeculativeConfig:
                         and getattr(hf, "block_size", None) is not None
                     ):
                         hf.n_predict = hf.block_size
+                elif self.method == "domino":
+                    hf = self.draft_model_config.hf_config
+                    if (
+                        getattr(hf, "n_predict", None) is None
+                        and getattr(hf, "block_size", None) is not None
+                    ):
+                        hf.n_predict = hf.block_size
+                    # Accept the training-time DominoDraftModel alias.
+                    hf.architectures = ["Qwen3DominoModel"]
+                    self.update_arch_()
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark", "domino"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1530,6 +1556,21 @@ class SpeculativeConfig:
                         self.draft_model_config,
                         self.num_speculative_tokens,
                     )
+
+                if self.method == "domino":
+                    domino_block_size = getattr(
+                        self.draft_model_config.hf_config, "block_size", None
+                    )
+                    if (
+                        domino_block_size is None
+                        or self.num_speculative_tokens != domino_block_size
+                    ):
+                        raise ValueError(
+                            "Domino requires num_speculative_tokens to match "
+                            "the trained block_size "
+                            f"({domino_block_size}); got "
+                            f"{self.num_speculative_tokens}."
+                        )
 
                 self.draft_tensor_parallel_size = (
                     SpeculativeConfig._verify_and_get_draft_tp(
@@ -1921,6 +1962,9 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_domino(self) -> bool:
+        return self.method == "domino"
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

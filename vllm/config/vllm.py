@@ -642,8 +642,13 @@ class VllmConfig:
             # decoding instead of standard next-token sampling, so it has a query
             # for the last sampled token plus queries for each draft token.
             return self.num_speculative_tokens + 1
-        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
-            # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
+        if (
+            speculative_config.use_eagle()
+            or speculative_config.uses_draft_model()
+            or speculative_config.use_domino()
+        ):
+            # DSpark (covered by use_eagle) and Domino draft a block of
+            # num_speculative_tokens
             # query tokens in which the anchor itself is the first prediction
             # position (no separate bonus query), so it needs exactly
             # num_speculative_tokens lookahead slots.
@@ -1419,7 +1424,7 @@ class VllmConfig:
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
-                    and self.speculative_config.method != "dspark"
+                    and self.speculative_config.method not in ("dspark", "domino")
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
@@ -1452,7 +1457,7 @@ class VllmConfig:
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
                 and self.speculative_config.method != "draft_model"
-                and self.speculative_config.method != "dspark"
+                and self.speculative_config.method not in ("dspark", "domino")
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -2854,7 +2859,7 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dspark", "domino")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
