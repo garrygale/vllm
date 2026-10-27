@@ -118,3 +118,126 @@ def test_combine_hidden_states_flare_orientation():
     per_layer = fused.view(2 * 5, num_draft_layers, target_hidden)
     for d in range(num_draft_layers):
         assert torch.equal(per_layer[:, d], taps[:, :, 1, :].reshape(2 * 5, target_hidden))
+
+
+# ---------------------------------------------------------------------------
+# out_proj_after_norm (fold + unfolded fallback)
+# ---------------------------------------------------------------------------
+
+import torch.nn.functional as F  # noqa: E402
+import pytest  # noqa: E402
+
+from vllm.model_executor.layers.linear import ReplicatedLinear  # noqa: E402
+from vllm.model_executor.layers.logits_processor import LogitsProcessor  # noqa: E402
+from vllm.model_executor.layers.vocab_parallel_embedding import (  # noqa: E402
+    ParallelLMHead,
+)
+from vllm.model_executor.models.qwen3_domino import (  # noqa: E402
+    _fold_output_proj_into_lm_head,
+)
+from vllm.platforms import current_platform  # noqa: E402
+
+CPU = ("cpu",)
+
+
+def _tiny_head_and_proj(device):
+    H_d, H_t, V = 8, 16, 32
+    lm_head = ParallelLMHead(V, H_t, prefix="lm_head")
+    output_proj = ReplicatedLinear(
+        H_d, H_t, bias=False, return_bias=False, prefix="model.output_proj"
+    )
+    with torch.no_grad():
+        lm_head.weight.normal_()
+        output_proj.weight.normal_()
+    return lm_head, output_proj, H_d, H_t, V
+
+
+def _fold_draft(lm_head, output_proj, hidden_proj=None):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            out_proj_after_norm=True,
+            output_proj=output_proj,
+            hidden_proj=hidden_proj,
+        ),
+        lm_head=lm_head,
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("device", CPU)
+def test_out_proj_fold_matches_unfolded_sequence(
+    default_vllm_config, dist_init, device
+) -> None:
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    lm_head, output_proj, H_d, H_t, V = _tiny_head_and_proj(device)
+    draft = _fold_draft(lm_head, output_proj)
+    assert _fold_output_proj_into_lm_head(draft)
+    assert draft.model.output_proj is None
+    assert draft.lm_head is not lm_head
+    assert draft.lm_head.weight.shape == (V, H_d)
+
+    hidden = torch.randn(4, H_d)
+    expected = F.linear(F.linear(hidden, output_proj.weight), lm_head.weight)
+    torch.testing.assert_close(
+        F.linear(hidden, draft.lm_head.weight), expected, atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("device", CPU)
+def test_out_proj_fold_skips_unfoldable_head(
+    default_vllm_config, dist_init, device
+) -> None:
+    torch.set_default_device(device)
+
+    lm_head, output_proj, _, _, _ = _tiny_head_and_proj(device)
+    lm_head.quant_method = object()  # not a dense unquantized head
+    draft = _fold_draft(lm_head, output_proj)
+    assert not _fold_output_proj_into_lm_head(draft)
+    assert draft.model.output_proj is output_proj
+    assert draft.lm_head is lm_head
+
+
+@pytest.mark.parametrize("device", CPU)
+def test_out_proj_fold_keeps_unfolded_head_for_hidden_proj(
+    default_vllm_config, dist_init, device
+) -> None:
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    lm_head, output_proj, H_d, H_t, V = _tiny_head_and_proj(device)
+    draft = _fold_draft(lm_head, output_proj, hidden_proj=object())
+    assert _fold_output_proj_into_lm_head(draft)
+    assert draft._unfolded_lm_head is lm_head
+
+
+@pytest.mark.parametrize("device", CPU)
+def test_compute_draft_logits_projects_unfolded_hidden(
+    default_vllm_config, dist_init, device
+) -> None:
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    lm_head, output_proj, H_d, H_t, V = _tiny_head_and_proj(device)
+    draft = object.__new__(Qwen3DominoForCausalLM)
+    draft.model = SimpleNamespace(
+        out_proj_after_norm=True, output_proj=output_proj
+    )
+    draft.lm_head = lm_head
+    draft.logits_processor = LogitsProcessor(V)
+
+    hidden = torch.randn(4, H_d)
+    expected = F.linear(F.linear(hidden, output_proj.weight), lm_head.weight)
+    torch.testing.assert_close(
+        draft.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
+    )
+
+    # Folded path: no output_proj left, the head does the whole job.
+    folded = _fold_draft(lm_head, output_proj)
+    _fold_output_proj_into_lm_head(folded)
+    draft.model.output_proj = None
+    draft.lm_head = folded.lm_head
+    torch.testing.assert_close(
+        draft.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
+    )
