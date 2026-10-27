@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Domino draft model unit tests (0.30 port, surviving subjects)."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -104,20 +104,31 @@ def test_combine_hidden_states_flare_orientation():
         num_target_features=num_taps,
         target_hidden_size=target_hidden,
         config=SimpleNamespace(num_hidden_layers=num_draft_layers),
-        layer_fusion_weights=torch.zeros(num_draft_layers, num_taps),
+        layer_fusion_weights=torch.full(
+            (num_draft_layers, num_taps), -10.0
+        ),
     )
-    # Route everything through tap 1 to make the orientation observable.
-    drafter.layer_fusion_weights[:, 1] = 10.0
+    # Route draft layer d to tap d; softmax makes a near-one-hot row, so a
+    # transposed fusion (weights applied over the draft-layer axis) would mix
+    # O(1)-different taps into every row. Compare with tolerance: softmax is
+    # never exactly one-hot.
+    for d in range(num_draft_layers):
+        drafter.layer_fusion_weights[d, d] = 10.0
     head = SimpleNamespace(model=drafter)
     taps = torch.arange(num_taps).float().view(1, 1, num_taps, 1).expand(
         2, 5, num_taps, target_hidden
     ).clone()
     fused = Qwen3DominoForCausalLM.combine_hidden_states(head, taps.reshape(2 * 5, -1))
     assert fused.shape == (2 * 5, num_draft_layers * target_hidden)
-    # Every draft layer's feature equals tap 1's rows, not tap d's.
+    # Draft layer d's feature must be tap d's rows, not any other tap's.
     per_layer = fused.view(2 * 5, num_draft_layers, target_hidden)
     for d in range(num_draft_layers):
-        assert torch.equal(per_layer[:, d], taps[:, :, 1, :].reshape(2 * 5, target_hidden))
+        torch.testing.assert_close(
+            per_layer[:, d],
+            taps[:, :, d, :].reshape(2 * 5, target_hidden),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +187,10 @@ def test_out_proj_fold_matches_unfolded_sequence(
     assert _fold_output_proj_into_lm_head(draft)
     assert draft.model.output_proj is None
     assert draft.lm_head is not lm_head
-    assert draft.lm_head.weight.shape == (V, H_d)
+    # The folded head keeps the original vocab padding; only the input width
+    # collapses to draft width.
+    assert draft.lm_head.weight.shape[0] == lm_head.weight.shape[0]
+    assert draft.lm_head.weight.shape[1] == H_d
 
     hidden = torch.randn(4, H_d)
     expected = F.linear(F.linear(hidden, output_proj.weight), lm_head.weight)
@@ -220,15 +234,24 @@ def test_compute_draft_logits_projects_unfolded_hidden(
     torch.manual_seed(0)
 
     lm_head, output_proj, H_d, H_t, V = _tiny_head_and_proj(device)
-    draft = object.__new__(Qwen3DominoForCausalLM)
-    draft.model = SimpleNamespace(
-        out_proj_after_norm=True, output_proj=output_proj
+    # Duck-typed draft: newer torch forbids assigning submodules on a
+    # Module built via object.__new__ without __init__, so bind the real
+    # method onto a plain namespace instead.
+    draft = SimpleNamespace(
+        model=SimpleNamespace(
+            out_proj_after_norm=True, output_proj=output_proj
+        ),
+        lm_head=lm_head,
+        logits_processor=LogitsProcessor(V),
     )
-    draft.lm_head = lm_head
-    draft.logits_processor = LogitsProcessor(V)
+    draft.compute_draft_logits = MethodType(
+        Qwen3DominoForCausalLM.compute_draft_logits, draft
+    )
 
     hidden = torch.randn(4, H_d)
     expected = F.linear(F.linear(hidden, output_proj.weight), lm_head.weight)
+    # LogitsProcessor trims the vocab padding off the head output.
+    expected = expected[:, :V]
     torch.testing.assert_close(
         draft.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
     )
