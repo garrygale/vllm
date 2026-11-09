@@ -245,12 +245,20 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        disable_tp: bool = False,
     ):
         super().__init__()
 
         # Keep the input dimensions.
-        tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.disable_tp = disable_tp
+        if disable_tp:
+            # Replicated table: every rank holds the full weight and skips
+            # the per-call collectives of a vocab shard.
+            tp_rank, self.tp_size = 0, 1
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -487,8 +495,13 @@ class VocabParallelEmbedding(PluggableLayer):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
+            # Reduce across all the model parallel GPUs.
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            # tp_size == 1 covers both a true single rank and a replicated
+            # (disable_tp) table: the lookup is already complete locally, and
+            # reducing again over the global TP group would multiply it.
+            output = output_parallel
         return output
 
     def extra_repr(self) -> str:
@@ -516,6 +529,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         params_dtype: type of the parameters.
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
+        disable_tp: If true, tensor parallelism will be disabled for this layer.
     """
 
     # --8<-- [end:parallel_lm_head]
@@ -530,6 +544,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        disable_tp: bool = False,
     ):
         super().__init__(
             num_embeddings,
@@ -539,6 +555,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             padding_size,
             quant_config,
             prefix,
+            disable_tp=disable_tp,
         )
         self.quant_config = quant_config
         if bias:
