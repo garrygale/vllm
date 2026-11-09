@@ -235,6 +235,17 @@ class RequestStateStats:
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
+    # Cumulative spec decoding stats (drafted/accepted tokens).
+    num_spec_draft_tokens: int = 0
+    num_spec_accepted_tokens: int = 0
+
+    @property
+    def spec_decode_acceptance_rate(self) -> float | None:
+        """Fraction of draft tokens accepted; None without spec decoding."""
+        if self.num_spec_draft_tokens == 0:
+            return None
+        return self.num_spec_accepted_tokens / self.num_spec_draft_tokens
+
 
 @dataclass
 class FinishedRequestStats:
@@ -395,6 +406,10 @@ class IterationStats:
             req_stats.first_token_latency = first_token_latency
 
         req_stats.num_generation_tokens += num_new_generation_tokens
+
+        # Spec decoding stats are cumulative per-request snapshots.
+        req_stats.num_spec_draft_tokens = output.num_spec_draft_tokens
+        req_stats.num_spec_accepted_tokens = output.num_spec_accepted_tokens
 
         # Track if this request is corrupted (only check once per request)
         # Early exit if already marked as corrupted to avoid redundant checks

@@ -96,6 +96,8 @@ class EngineCoreOutput(
     prefill_stats: object | None = None
     routed_experts: object | None = None
     num_nans_in_logits: int = 0
+    num_spec_draft_tokens: int = 0
+    num_spec_accepted_tokens: int = 0
 
 
 class EngineCoreOutputs(

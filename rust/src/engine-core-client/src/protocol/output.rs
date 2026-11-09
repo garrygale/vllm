@@ -112,6 +112,11 @@ pub struct EngineCoreOutput {
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
     pub num_nans_in_logits: u32,
+    /// Cumulative spec decoding stats for this request (drafted/accepted).
+    #[serde(default)]
+    pub num_spec_draft_tokens: u32,
+    #[serde(default)]
+    pub num_spec_accepted_tokens: u32,
 }
 
 impl EngineCoreOutput {
@@ -384,6 +389,8 @@ mod tests {
                 prefill_stats: None,
                 routed_experts: None,
                 num_nans_in_logits: 0,
+                num_spec_draft_tokens: 0,
+                num_spec_accepted_tokens: 0,
             }],
             finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
             ..Default::default()
@@ -437,6 +444,8 @@ mod tests {
                             prefill_stats: None,
                             routed_experts: None,
                             num_nans_in_logits: 0,
+                num_spec_draft_tokens: 0,
+                num_spec_accepted_tokens: 0,
                         },
                     ],
                     scheduler_stats: None,

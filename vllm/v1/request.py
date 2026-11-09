@@ -165,6 +165,9 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        # Cumulative spec decoding stats (drafted/accepted tokens).
+        self.num_spec_draft_tokens: int = 0
+        self.num_spec_accepted_tokens: int = 0
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

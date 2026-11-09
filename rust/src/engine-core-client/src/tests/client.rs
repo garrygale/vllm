@@ -234,6 +234,8 @@ fn request_output(
         prefill_stats: None,
         routed_experts: None,
         num_nans_in_logits: 0,
+        num_spec_draft_tokens: 0,
+        num_spec_accepted_tokens: 0,
     }
 }
 
@@ -2526,6 +2528,8 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         prefill_stats: None,
                         routed_experts: None,
                         num_nans_in_logits: 0,
+        num_spec_draft_tokens: 0,
+        num_spec_accepted_tokens: 0,
                     },
                 ],
                 scheduler_stats: None,

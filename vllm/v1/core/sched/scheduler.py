@@ -1697,6 +1697,13 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                num_invalid_spec = (
+                    scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                    if scheduler_output.num_invalid_spec_tokens
+                    else 0
+                )
+                request.num_spec_draft_tokens += num_draft_tokens - num_invalid_spec
+                request.num_spec_accepted_tokens += num_accepted
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1850,6 +1857,8 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        num_spec_draft_tokens=request.num_spec_draft_tokens,
+                        num_spec_accepted_tokens=request.num_spec_accepted_tokens,
                     )
                 )
             else:

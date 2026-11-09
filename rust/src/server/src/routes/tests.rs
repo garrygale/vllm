@@ -84,6 +84,8 @@ fn request_output_with_stop_reason(
         prefill_stats: None,
         routed_experts: None,
         num_nans_in_logits: 0,
+        num_spec_draft_tokens: 0,
+        num_spec_accepted_tokens: 0,
     }
 }
 
@@ -110,6 +112,8 @@ fn request_output_with_logprobs(
         prefill_stats: None,
         routed_experts: None,
         num_nans_in_logits: 0,
+        num_spec_draft_tokens: 0,
+        num_spec_accepted_tokens: 0,
     }
 }
 
@@ -138,6 +142,8 @@ fn request_output_with_logprobs_and_kv(
         prefill_stats: None,
         routed_experts: None,
         num_nans_in_logits: 0,
+        num_spec_draft_tokens: 0,
+        num_spec_accepted_tokens: 0,
     }
 }
 

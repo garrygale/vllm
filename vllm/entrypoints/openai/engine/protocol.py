@@ -125,6 +125,10 @@ class PerRequestTimingMetrics(OpenAIBaseModel):
     queue_time_ms: float | None = None
     mean_itl_ms: float | None = None
     tokens_per_second: float | None = None
+    # Cumulative spec decoding stats; ``None`` without speculative decoding.
+    spec_decode_num_draft_tokens: int | None = None
+    spec_decode_num_accepted_tokens: int | None = None
+    spec_decode_acceptance_rate: float | None = None
 
 
 class RequestResponseMetadata(BaseModel):

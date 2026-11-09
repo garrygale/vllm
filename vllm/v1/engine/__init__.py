@@ -200,6 +200,9 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # Cumulative spec decoding stats for this request (drafted/accepted).
+    num_spec_draft_tokens: int = 0
+    num_spec_accepted_tokens: int = 0
 
     @property
     def finished(self) -> bool:

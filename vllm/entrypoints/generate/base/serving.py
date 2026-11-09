@@ -70,6 +70,9 @@ def build_per_request_timing_metrics(
     queue_time_ms: float | None = None
     mean_itl_ms: float | None = None
     tokens_per_second: float | None = None
+    spec_decode_num_draft_tokens: int | None = None
+    spec_decode_num_accepted_tokens: int | None = None
+    spec_decode_acceptance_rate: float | None = None
 
     if scheduled_ts > 0 and first_token_ts > 0:
         time_to_first_token_ms = (first_token_ts - scheduled_ts) * 1000
@@ -89,12 +92,20 @@ def build_per_request_timing_metrics(
         if inference_time_ms > 0:
             tokens_per_second = num_generation_tokens / inference_time_ms * 1000
 
+    if metrics.num_spec_draft_tokens > 0:
+        spec_decode_num_draft_tokens = metrics.num_spec_draft_tokens
+        spec_decode_num_accepted_tokens = metrics.num_spec_accepted_tokens
+        spec_decode_acceptance_rate = metrics.spec_decode_acceptance_rate
+
     return PerRequestTimingMetrics(
         time_to_first_token_ms=time_to_first_token_ms,
         generation_time_ms=generation_time_ms,
         queue_time_ms=queue_time_ms,
         mean_itl_ms=mean_itl_ms,
         tokens_per_second=tokens_per_second,
+        spec_decode_num_draft_tokens=spec_decode_num_draft_tokens,
+        spec_decode_num_accepted_tokens=spec_decode_num_accepted_tokens,
+        spec_decode_acceptance_rate=spec_decode_acceptance_rate,
     )
 
 
