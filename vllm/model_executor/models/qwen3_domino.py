@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Qwen3Config
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -356,6 +357,7 @@ class DominoQwen3DecoderLayer(DFlashQwen3DecoderLayer):
         )
 
 
+@support_torch_compile
 class Qwen3DominoModel(DFlashQwen3Model):
     """Qwen3 Domino draft model.
 
@@ -438,6 +440,13 @@ class Qwen3DominoModel(DFlashQwen3Model):
             self.target_hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        # State the inherited DFlash methods read (embed_input_ids walks the
+        # mask-embedding override even when absent). The base __init__ that
+        # would set these is deliberately skipped, so set them here; no
+        # separate mask_embedding parameter is registered (domino masks via
+        # the vocabulary slot at mask_token_id).
+        self.use_aux_hidden_state = False
+        self.has_separate_mask_embedding = False
 
         self.input_proj = None
         self.output_proj = None
@@ -730,6 +739,7 @@ class Qwen3DominoModel(DFlashQwen3Model):
             )
 
 
+@support_torch_compile
 class Qwen3DominoForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = Qwen3DominoModel
 
