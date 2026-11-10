@@ -1074,8 +1074,22 @@ def load_domino_model(
             "Domino does not support pipeline parallelism."
         )
 
+    # The draft's parallel_config must be the DRAFT's, not the target's:
+    # parallel layers read config.parallel_config at construction (and the
+    # global TP group below it), so leaving the target's TP here would
+    # shard the draft regardless of draft_tensor_parallel_size (the 0.26
+    # behavior). Mirror load_dspark_model's parallel replacement.
+    draft_parallel_config = replace(
+        speculative_config.draft_parallel_config,
+        pipeline_parallel_size=1,
+        rank=vllm_config.parallel_config.rank,
+        distributed_executor_backend=(
+            vllm_config.parallel_config.distributed_executor_backend
+        ),
+    )
     draft_vllm_config = replace(
         vllm_config,
+        parallel_config=draft_parallel_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=domino_has_any_non_causal(
