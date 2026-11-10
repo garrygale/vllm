@@ -635,6 +635,17 @@ class Qwen3DominoModel(DFlashQwen3Model):
             hidden_states = self.output_proj(hidden_states)
         return self.norm(hidden_states)
 
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        # Names arriving here were already mapped by the ForCausalLM loader
+        # (gate_up stacking + checkpoint-dependent skips).  Override the
+        # DFlash base loader: its hf_to_vllm_mapper fuses q/k/v into
+        # qkv_proj, which does not apply to domino's separate projections
+        # (and its mask_embedding read is handled by the outer skips).
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
+
     def _build_fused_kv_buffers(self) -> None:
         # Domino's precompute runs per-layer (platform-neutral: module
         # RMSNorm + real-key rotary); no fused GEMM buffers are built.
@@ -926,23 +937,31 @@ class Qwen3DominoForCausalLM(DFlashQwen3ForCausalLM):
         self.has_own_lm_head = includes_lm_head
 
         # Domino checkpoints keep unrenumbered draft-layer keys; the fused
-        # gate_up mapping is the only rename needed.
+        # gate_up mapping is the only rename needed.  Weights the checkpoint
+        # does not carry (shared target embed/lm_head, optional d2t) are
+        # skipped by mapping the substring to None -- v0.30 removed the
+        # loader's skip_substrs constructor kwargs (#53106) in favor of this
+        # mapper form (same pattern as the 0.30 DFlash loader).
+        orig_to_new_substr = {
+            "mask_embedding": None,
+            # flare checkpoints ship layer_fusion_weights, never fc.
+            "fc.": None,
+        }
+        if not includes_embed_tokens:
+            orig_to_new_substr["embed_tokens"] = None
+        if not includes_lm_head:
+            orig_to_new_substr["lm_head"] = None
+        if not includes_draft_id_mapping:
+            orig_to_new_substr["draft_id_to_target_id"] = None
         mapper = WeightsMapper(
+            orig_to_new_substr=orig_to_new_substr,
             orig_to_new_stacked={
                 ".gate_proj": (".gate_up_proj", 0),
                 ".up_proj": (".gate_up_proj", 1),
             },
         )
 
-        skip_substrs = ["mask_embedding", "fc."]
-        if not includes_embed_tokens:
-            skip_substrs.append("embed_tokens")
-        if not includes_lm_head:
-            skip_substrs.append("lm_head")
-        if not includes_draft_id_mapping:
-            skip_substrs.append("draft_id_to_target_id")
-
-        loader = AutoWeightsLoader(self, skip_substrs=skip_substrs)
+        loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
 
 

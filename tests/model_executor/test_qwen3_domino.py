@@ -264,3 +264,97 @@ def test_compute_draft_logits_projects_unfolded_hidden(
     torch.testing.assert_close(
         draft.compute_draft_logits(hidden), expected, atol=1e-4, rtol=1e-4
     )
+
+
+# ---------------------------------------------------------------------------
+# load_weights round-trip (regression: the 0.26 skip_substrs constructor API
+# was removed before v0.30.0 -- #53106 -- so the loader must use the
+# mapper-to-None skipping form)
+# ---------------------------------------------------------------------------
+
+def test_load_weights_round_trip(default_vllm_config, dist_init, device="cpu"):
+    import json
+    import os
+    import tempfile
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+
+    draft_dir = tempfile.mkdtemp(prefix="domino_loadtest_")
+    draft = json.load(open(os.path.join(os.path.dirname(__file__), "_domino_loadtest_config.json")))
+    with open(os.path.join(draft_dir, "config.json"), "w") as f:
+        json.dump(draft, f)
+    target_dir = tempfile.mkdtemp(prefix="domino_loadtest_target_")
+    target = dict(draft)
+    target.pop("dflash_config")
+    target.pop("block_size")
+    target["architectures"] = ["Qwen3ForCausalLM"]
+    target["layer_types"] = ["full_attention"] * 2
+    target["hidden_size"] = 64
+    target["num_target_layers"] = 2
+    with open(os.path.join(target_dir, "config.json"), "w") as f:
+        json.dump(target, f)
+
+    args = EngineArgs(
+        model=target_dir,
+        speculative_config={
+            "method": "domino",
+            "model": draft_dir,
+            "num_speculative_tokens": 7,
+        },
+    )
+    cfg = args.create_engine_config()
+    torch.set_default_device("cpu")
+    with set_current_vllm_config(cfg):
+        from vllm.model_executor.models.qwen3_domino import (
+            Qwen3DominoForCausalLM,
+        )
+
+        model = Qwen3DominoForCausalLM(vllm_config=cfg, prefix="")
+
+    # Synthesize a checkpoint in the exported naming scheme: draft modules
+    # under "model.", separate gate/up projections, no embed_tokens/lm_head
+    # (shared from the target at load_domino_model time).
+    gen = torch.Generator().manual_seed(7)
+    state = {}
+    for name, param in model.named_parameters():
+        if not name.startswith("model."):
+            continue  # lm_head stays shared
+        if "embed_tokens" in name or "lm_head" in name:
+            continue
+        ck_name = name
+        if ".mlp.gate_up_proj.weight" in name:
+            base = name[: name.index(".mlp.gate_up_proj.weight")]
+            shard = param.shape[0] // 2
+            # Checkpoint pieces follow the [output, input] layout the
+            # merged-column weight_loader narrows along dim 0.
+            state[base + ".mlp.gate_proj.weight"] = torch.randn(
+                shard, param.shape[1], generator=gen
+            )
+            state[base + ".mlp.up_proj.weight"] = torch.randn(
+                shard, param.shape[1], generator=gen
+            )
+            continue
+        state[ck_name] = torch.randn(param.shape, generator=gen)
+
+    model.load_weights(iter(state.items()))
+
+    # Values landed (unrenumbered keys + fused gate_up halves).
+    with torch.no_grad():
+        base = next(
+            n for n, _ in model.named_parameters()
+            if n.endswith("layers.0.mlp.gate_up_proj.weight")
+        )
+        param = dict(model.named_parameters())[base]
+        stem = base[: base.index(".mlp.gate_up_proj.weight")]
+        half = param.shape[0] // 2
+        torch.testing.assert_close(
+            param[:half], state[stem + ".mlp.gate_proj.weight"]
+        )
+        torch.testing.assert_close(
+            param[half:], state[stem + ".mlp.up_proj.weight"]
+        )
+        fusion = dict(model.named_parameters())["model.layer_fusion_weights"]
+        torch.testing.assert_close(
+            fusion, state["model.layer_fusion_weights"].to(fusion.dtype)
+        )
