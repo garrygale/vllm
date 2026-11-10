@@ -352,6 +352,16 @@ def test_load_weights_round_trip(default_vllm_config, dist_init, device="cpu"):
             continue
         state[ck_name] = torch.randn(param.shape, generator=gen)
 
+    # TP=1 construction runs the draft fully unsharded (draft_disable_tp):
+    # every parallel layer replicated, full-width embed/lm_head.
+    assert model.model.draft_disable_tp is True
+    assert model.model.embed_tokens.tp_size == 1
+    attn0 = model.model.layers[0].self_attn
+    for layer_name in ("qkv_proj", "o_proj", "k_target_proj", "v_target_proj"):
+        assert getattr(attn0, layer_name).tp_size == 1, layer_name
+    assert model.lm_head.tp_size == 1
+    assert model.model.embed_tokens.weight.shape[0] >= 2048  # full padded vocab
+
     model.load_weights(iter(state.items()))
 
     # Values landed (unrenumbered keys + fused gate_up halves).

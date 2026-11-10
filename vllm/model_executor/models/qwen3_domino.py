@@ -188,6 +188,7 @@ class DominoQwen3Attention(nn.Module):
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -223,6 +224,7 @@ class DominoQwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=disable_tp,
         )
         self.k_target_proj = None
         self.v_target_proj = None
@@ -238,6 +240,7 @@ class DominoQwen3Attention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.k_target_proj",
                 return_bias=False,
+                disable_tp=disable_tp,
             )
             self.v_target_proj = ColumnParallelLinear(
                 target_hidden_size,
@@ -246,6 +249,7 @@ class DominoQwen3Attention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.v_target_proj",
                 return_bias=False,
+                disable_tp=disable_tp,
             )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -253,6 +257,7 @@ class DominoQwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=disable_tp,
         )
 
         self.rotary_emb = get_rope(
@@ -316,6 +321,7 @@ class DominoQwen3DecoderLayer(DFlashQwen3DecoderLayer):
         cache_config=None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ) -> None:
         # Skip the DFlash layer __init__ (its attention is fused-qkv); the
         # residual-pattern forward is inherited unchanged.
@@ -339,6 +345,7 @@ class DominoQwen3DecoderLayer(DFlashQwen3DecoderLayer):
             quant_config=quant_config,
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
+            disable_tp=disable_tp,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -419,6 +426,18 @@ class Qwen3DominoModel(DFlashQwen3Model):
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.mask_token_id = dflash_config.get("mask_token_id")
 
+        # draft_tensor_parallel_size == 1: every parallel layer is built
+        # replicated (disable_tp) regardless of the target's TP group. The
+        # layer constructors otherwise read the GLOBAL tensor-parallel
+        # state, which is the target's -- the draft_parallel_config never
+        # reaches them, so a "TP=1" draft silently ran sharded under the
+        # target's TP group (0.26 behaved the same). Cost: each rank holds
+        # the full draft weights (embed/lm_head included, see
+        # load_domino_model) instead of a shard.
+        self.draft_disable_tp = (
+            vllm_config.parallel_config.tensor_parallel_size == 1
+        )
+
         # Mirrors SpecForge's dflash_config.out_proj_after_norm: the final
         # norm runs at draft width and output_proj sits between it and the
         # lm_head (folded away at load time when the head allows it).
@@ -430,6 +449,7 @@ class Qwen3DominoModel(DFlashQwen3Model):
             self.vocab_size,
             self.target_hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            disable_tp=self.draft_disable_tp,
         )
         # State the inherited DFlash methods read (embed_input_ids walks the
         # mask-embedding override even when absent). The base __init__ that
@@ -480,6 +500,7 @@ class Qwen3DominoModel(DFlashQwen3Model):
                     prefix=maybe_prefix(
                         prefix, f"layers.{layer_idx + start_layer_id}"
                     ),
+                    disable_tp=self.draft_disable_tp,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -750,6 +771,7 @@ class Qwen3DominoForCausalLM(DFlashQwen3ForCausalLM):
             self.config.draft_vocab_size,
             self.model.target_hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            disable_tp=self.model.draft_disable_tp,
         )
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
@@ -1085,11 +1107,34 @@ def load_domino_model(
     target_inner = target_language_model.model
     draft_inner = draft_model.model
 
+    # An unsharded draft (draft_tensor_parallel_size == 1 under a TP>1
+    # target) cannot share the target's vocab-sharded embed/lm_head: the
+    # shapes differ. Share the target's module only when both sides run
+    # unsharded; otherwise give the draft its own full-width copy by
+    # all-gathering the target's shards (one-time load-time collective).
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    def _full_copy_from_sharded(sharded_param, full_param) -> None:
+        full = tensor_model_parallel_all_gather(sharded_param.data, dim=0)
+        n = min(full.shape[0], full_param.shape[0])
+        with torch.no_grad():
+            full_param.data.copy_(full[:n])
+
+    draft_unsharded = bool(
+        getattr(draft_inner, "draft_disable_tp", False)
+    ) and speculative_config.target_parallel_config.tensor_parallel_size > 1
+
     target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
         target_inner, "embedding", None
     )
     draft_embed = getattr(draft_inner, "embed_tokens", None)
-    if target_embed is not None and _should_share(
+    if draft_unsharded:
+        if draft_embed is not None and target_embed is not None:
+            _full_copy_from_sharded(target_embed.weight, draft_embed.weight)
+            draft_model.has_own_embed_tokens = True
+        # else: checkpoint carried its own embed (loaded by the loader) or
+        # the target has none; nothing to do.
+    elif target_embed is not None and _should_share(
         draft_model, "has_own_embed_tokens", draft_embed, target_embed
     ):
         if draft_embed is not None:
@@ -1098,7 +1143,11 @@ def load_domino_model(
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
+    if draft_unsharded:
+        if draft_lm_head is not None and target_lm_head is not None:
+            _full_copy_from_sharded(target_lm_head.weight, draft_lm_head.weight)
+            draft_model.has_own_lm_head = True
+    elif target_lm_head is not None and _should_share(
         draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:
