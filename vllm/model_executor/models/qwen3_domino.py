@@ -1034,6 +1034,10 @@ def _fold_output_proj_into_lm_head(draft_model: nn.Module) -> bool:
         params_dtype=weight.dtype,
         padding_size=head.padding_size,
         prefix="lm_head",
+        # Inherit the source head's replication: an unsharded draft folds a
+        # full-width head, and a default (global-TP) ParallelLMHead would
+        # build a vocab shard instead.
+        disable_tp=getattr(head, "disable_tp", False),
     )
     assert new_head.weight.shape[0] == fused.shape[0], (
         f"folded lm_head shard {tuple(fused.shape)} does not match a fresh "
