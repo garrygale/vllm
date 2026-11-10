@@ -36,8 +36,10 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -58,7 +60,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3_dflash import DFlashQwen3DecoderLayer, DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import (
     AutoWeightsLoader,
@@ -312,6 +313,48 @@ class DominoQwen3Attention(nn.Module):
         return output
 
 
+class DominoMLP(nn.Module):
+    """Qwen3 MLP with disable_tp threading.
+
+    The shared Qwen2MLP cannot receive the draft's unsharded flag, so an
+    unsharded draft's gate_up/down stayed sharded under the target's TP
+    group (per-layer all_reduce after down_proj). Same structure otherwise.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        disable_tp: bool = False,
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+            disable_tp=disable_tp,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            disable_tp=disable_tp,
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
 class DominoQwen3DecoderLayer(DFlashQwen3DecoderLayer):
     """DFlash decoder layer with domino's heterogeneous-KV attention."""
 
@@ -351,12 +394,12 @@ class DominoQwen3DecoderLayer(DFlashQwen3DecoderLayer):
             prefix=f"{prefix}.self_attn",
             disable_tp=disable_tp,
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = DominoMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            disable_tp=disable_tp,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
