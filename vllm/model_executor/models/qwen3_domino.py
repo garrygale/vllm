@@ -41,7 +41,6 @@ from vllm.config import VllmConfig, get_current_vllm_config, replace
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -1958,9 +1957,6 @@ class Qwen3DominoModel(nn.Module):
                 fc1_out = (
                     2 * self.emb_dim if self.correction_swiglu else self.emb_dim
                 )
-                # fc2 is replicated (disable_tp): the sequential walk reads it
-                # once per draft position, and a vocab shard would turn every
-                # step into a partial GEMM plus a full-vocab all-gather.
                 self.embed_proj = nn.Sequential(
                     ReplicatedLinear(
                         in_dim,
@@ -1978,7 +1974,6 @@ class Qwen3DominoModel(nn.Module):
                         params_dtype=vllm_config.model_config.dtype,
                         quant_config=self.quant_config,
                         prefix=maybe_prefix(prefix, "embed_proj.2"),
-                        disable_tp=True,
                     ),
                 )
         else:
@@ -3512,28 +3507,11 @@ def _fold_output_proj_into_lm_head(draft_model: nn.Module) -> bool:
     return True
 
 
-def _replicated_head_weight(head: nn.Module) -> torch.Tensor:
-    """Full padded-vocab weight of ``head``, gathered from the TP shards.
-
-    The vocab shards are contiguous slices of the padded vocab, so gathering
-    in rank order reconstructs the full table. Used once at load time to fold
-    a sharded head into a replicated (disable_tp) walk head.
-    """
-    weight = head.weight.data
-    if head.tp_size == 1:
-        return weight
-    return tensor_model_parallel_all_gather(weight, dim=0)
-
-
 def _fold_shared_emb_readout(draft_model: nn.Module) -> None:
     """Fold the shared emb readout: ``W_lm @ W_up`` into a ``[V, emb]`` head.
 
     Every correction-step projection (base + correction) then runs as one
-    emb-width GEMM on ``head_down_proj(z) + embed_proj(gru_state)``. The
-    folded head is read once per draft position by the sequential walk, so it
-    is replicated (disable_tp): a vocab shard would add a full-vocab
-    all-gather to every step. The source head may still be TP-sharded; its
-    shards are all-gathered once here to assemble the full table. There is
+    emb-width GEMM on ``head_down_proj(z) + embed_proj(gru_state)``. There is
     deliberately no unfolded fallback: without the fold each step would run
     three vocab-width GEMMs (two of them full target-width), strictly worse
     than the flag-off paths, so an unfoldable head raises instead.
@@ -3556,25 +3534,24 @@ def _fold_shared_emb_readout(draft_model: nn.Module) -> None:
         )
 
     up_w = model.head_up_proj.weight.data
-    fused = torch.matmul(_replicated_head_weight(head), up_w).to(weight.dtype)
+    fused = torch.matmul(weight.data, up_w).to(weight.dtype)
     new_head = ParallelLMHead(
         head.num_embeddings,
         up_w.shape[1],
         params_dtype=weight.dtype,
         padding_size=head.padding_size,
         prefix="lm_head",
-        disable_tp=True,
     )
-    assert new_head.weight.shape == fused.shape, (
-        f"folded shared-readout head {tuple(fused.shape)} does not match a "
-        f"fresh replicated head {tuple(new_head.weight.shape)}"
+    assert new_head.weight.shape[0] == fused.shape[0], (
+        f"folded shared-readout head shard {tuple(fused.shape)} does not "
+        f"match a fresh head shard {tuple(new_head.weight.shape)}"
     )
     new_head.weight = nn.Parameter(fused, requires_grad=False)
     draft_model.lm_head = new_head
     model.head_up_proj = None
     logger.info(
         "shared_emb_readout: folded lm_head @ head_up_proj into a "
-        f"{tuple(fused.shape)} replicated emb-width head"
+        f"{tuple(fused.shape)} emb-width head"
     )
 
 

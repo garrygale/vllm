@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    VocabParallelEmbedding,
 )
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
@@ -39,10 +40,6 @@ class DSparkMarkovHead(nn.Module):
     ``vocab_size``); ``markov_w2`` projects it to a draft-vocab bias
     (``draft_vocab_size``) added to the base draft logits. The two sizes
     coincide for full-vocab drafts.
-
-    Both weights are replicated because the head runs sequentially for every
-    draft position. Sharding them would add an all-reduce and a full-vocab
-    gather to each position.
     """
 
     def __init__(
@@ -53,12 +50,12 @@ class DSparkMarkovHead(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+        # TODO(ben): profile for which (if any) it makes sense to replicate or TP-shard
+        self.markov_w1 = VocabParallelEmbedding(
+            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
+        )
         self.markov_w2 = ParallelLMHead(
-            draft_vocab_size,
-            markov_rank,
-            prefix=maybe_prefix(prefix, "markov_w2"),
-            disable_tp=True,
+            draft_vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w2")
         )
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
