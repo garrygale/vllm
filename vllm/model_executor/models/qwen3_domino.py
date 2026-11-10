@@ -195,7 +195,11 @@ class DominoQwen3Attention(nn.Module):
         self.sliding_window = sliding_window
         self.hidden_size = hidden_size
         self.target_hidden_size = target_hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        # Per-rank head counts must follow the LAYERS' sharding, not the
+        # global TP group: with disable_tp the projections carry full-width
+        # weights, so q_size/kv_size must be full width too (the global
+        # group is the target's and stays TP=2 under draft TP=1).
+        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
