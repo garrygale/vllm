@@ -335,6 +335,21 @@ def test_load_weights_round_trip(default_vllm_config, dist_init, device="cpu"):
                 shard, param.shape[1], generator=gen
             )
             continue
+        if ".self_attn.qkv_proj.weight" in name:
+            # Checkpoints ship separate q/k/v; the loader stacks them into
+            # the fused projection.
+            base = name[: name.index(".self_attn.qkv_proj.weight")]
+            attn_mod = model.get_submodule(base + ".self_attn")
+            state[base + ".self_attn.q_proj.weight"] = torch.randn(
+                attn_mod.q_size, param.shape[1], generator=gen
+            )
+            state[base + ".self_attn.k_proj.weight"] = torch.randn(
+                attn_mod.kv_size, param.shape[1], generator=gen
+            )
+            state[base + ".self_attn.v_proj.weight"] = torch.randn(
+                attn_mod.kv_size, param.shape[1], generator=gen
+            )
+            continue
         state[ck_name] = torch.randn(param.shape, generator=gen)
 
     model.load_weights(iter(state.items()))
@@ -353,6 +368,24 @@ def test_load_weights_round_trip(default_vllm_config, dist_init, device="cpu"):
         )
         torch.testing.assert_close(
             param[half:], state[stem + ".mlp.up_proj.weight"]
+        )
+        params = dict(model.named_parameters())
+        qkv_name = next(
+            n for n, _ in model.named_parameters()
+            if n.endswith("layers.0.self_attn.qkv_proj.weight")
+        )
+        qkv = params[qkv_name]
+        stem = qkv_name[: qkv_name.index(".self_attn.qkv_proj.weight")]
+        attn_mod = model.get_submodule(stem + ".self_attn")
+        qs, kvs = attn_mod.q_size, attn_mod.kv_size
+        torch.testing.assert_close(
+            qkv[:qs], state[stem + ".self_attn.q_proj.weight"]
+        )
+        torch.testing.assert_close(
+            qkv[qs : qs + kvs], state[stem + ".self_attn.k_proj.weight"]
+        )
+        torch.testing.assert_close(
+            qkv[qs + kvs :], state[stem + ".self_attn.v_proj.weight"]
         )
         fusion = dict(model.named_parameters())["model.layer_fusion_weights"]
         torch.testing.assert_close(

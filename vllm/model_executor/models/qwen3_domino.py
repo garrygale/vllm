@@ -38,6 +38,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -208,47 +209,42 @@ class DominoQwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = ColumnParallelLinear(
+        # Fused draft q/k/v (upstream DFlash form): one GEMM feeds the
+        # q/k-norm+rope path, and the split_qkv_rmsnorm_rope compilation
+        # pass (vllm-ascend QKNormRopeFusionPattern) matches the fused
+        # split -- separate projections would defeat it and reintroduce the
+        # per-attention TensorMove pair. Checkpoints ship separate q/k/v;
+        # the load mapper stacks them.
+        self.qkv_proj = QKVParallelLinear(
             hidden_size,
-            self.total_num_heads * self.head_dim,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
-            return_bias=False,
+            prefix=f"{prefix}.qkv_proj",
         )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size,
-            self.total_num_kv_heads * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.k_proj",
-            return_bias=False,
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden_size,
-            self.total_num_kv_heads * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.v_proj",
-            return_bias=False,
-        )
-        self.k_proj_target = None
-        self.v_proj_target = None
+        self.k_target_proj = None
+        self.v_target_proj = None
         if target_hidden_size is not None:
-            self.k_proj_target = ColumnParallelLinear(
+            # Named *_target_proj (not k/v_proj_target): the load mapper's
+            # ".k_proj"/".v_proj" substrings would otherwise capture these
+            # too and stack them into the draft qkv_proj. The checkpoint's
+            # SpecForge names are renamed during load preprocessing.
+            self.k_target_proj = ColumnParallelLinear(
                 target_hidden_size,
                 self.total_num_kv_heads * self.head_dim,
                 bias=attention_bias,
                 quant_config=quant_config,
-                prefix=f"{prefix}.k_proj_target",
+                prefix=f"{prefix}.k_target_proj",
                 return_bias=False,
             )
-            self.v_proj_target = ColumnParallelLinear(
+            self.v_target_proj = ColumnParallelLinear(
                 target_hidden_size,
                 self.total_num_kv_heads * self.head_dim,
                 bias=attention_bias,
                 quant_config=quant_config,
-                prefix=f"{prefix}.v_proj_target",
+                prefix=f"{prefix}.v_target_proj",
                 return_bias=False,
             )
         self.o_proj = RowParallelLinear(
@@ -257,7 +253,6 @@ class DominoQwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            return_bias=False,
         )
 
         self.rotary_emb = get_rope(
@@ -289,10 +284,11 @@ class DominoQwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        # Per-head RMSNorm (same form as DFlashQwen3Attention so the
+        # QKNormRopeFusion pattern can fuse split+norm+rope).
         q_shape, k_shape = q.shape, k.shape
         q = self.q_norm(
             q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
@@ -303,7 +299,7 @@ class DominoQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        output = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -411,19 +407,14 @@ class Qwen3DominoModel(DFlashQwen3Model):
             dflash_config.get("heterogeneous_kv", True)
         )
         self.context_hidden_size = self.target_hidden_size
-        proj_input = (
-            self.target_hidden_size
-            if self.heterogeneous_kv
-            else self.config.hidden_size
-        )
-        if proj_input != self.context_hidden_size:
-            raise ValueError(
-                "dflash_config.heterogeneous_kv="
-                f"{self.heterogeneous_kv} needs the fused context feature "
-                f"({self.context_hidden_size}) to match the target K/V "
-                f"projection input ({proj_input}); flare requires "
-                "heterogeneous_kv=true unless target_hidden_size == "
-                "hidden_size"
+        if not self.heterogeneous_kv:
+            # Shared draft/context K/V would have to ride the fused
+            # qkv_proj's k/v halves (no separate modules to call); only the
+            # unported fc fusion ever used this mode, so fail closed.
+            raise NotImplementedError(
+                "dflash_config.heterogeneous_kv=false is not supported on "
+                "this port; the flare contract uses dedicated "
+                "k/v_proj_target projections"
             )
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.mask_token_id = dflash_config.get("mask_token_id")
@@ -543,12 +534,17 @@ class Qwen3DominoModel(DFlashQwen3Model):
                     return_bias=False,
                 ),
                 nn.SiLU(),
+                # Replicated like DSpark's markov_w2 (disable_tp): the head
+                # runs sequentially for every draft position, and sharding
+                # it would add an all-reduce plus a full-vocab gather to
+                # each step of the GRU correction loop.
                 ParallelLMHead(
                     self.vocab_size,
                     self.emb_dim,
                     params_dtype=vllm_config.model_config.dtype,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "embed_proj.2"),
+                    disable_tp=True,
                 ),
             )
         else:
@@ -698,18 +694,10 @@ class Qwen3DominoModel(DFlashQwen3Model):
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             ctx = self.hidden_norm(fused[:, i, :])
-            k_proj = (
-                attn.k_proj_target
-                if attn.k_proj_target is not None
-                else attn.k_proj
-            )
-            v_proj = (
-                attn.v_proj_target
-                if attn.v_proj_target is not None
-                else attn.v_proj
-            )
-            k = k_proj(ctx)
-            v = v_proj(ctx)
+            # heterogeneous_kv is fail-closed true, so the dedicated
+            # target projections always exist.
+            k = attn.k_target_proj(ctx)
+            v = attn.v_target_proj(ctx)
             k_shape = k.shape
             k = attn.k_norm(
                 k.view(
@@ -929,6 +917,13 @@ class Qwen3DominoForCausalLM(DFlashQwen3ForCausalLM):
                 name = name[len("model."):]
             if "t2d" in name:
                 continue
+            # SpecForge names the context projections k/v_proj_target;
+            # rename so the ".k_proj"/".v_proj" stack substrings cannot
+            # capture them (the modules are k/v_target_proj).
+            if "k_proj_target" in name:
+                name = name.replace("k_proj_target", "k_target_proj")
+            if "v_proj_target" in name:
+                name = name.replace("v_proj_target", "v_target_proj")
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
@@ -966,6 +961,9 @@ class Qwen3DominoForCausalLM(DFlashQwen3ForCausalLM):
         mapper = WeightsMapper(
             orig_to_new_substr=orig_to_new_substr,
             orig_to_new_stacked={
+                ".q_proj": (".qkv_proj", "q"),
+                ".k_proj": (".qkv_proj", "k"),
+                ".v_proj": (".qkv_proj", "v"),
                 ".gate_proj": (".gate_up_proj", 0),
                 ".up_proj": (".gate_up_proj", 1),
             },
